@@ -1,0 +1,7 @@
+*.log
+merge_chat_config.json
+__pycache__/
+*.pyc
+*.pyo
+merge_chat.iconset/
+.DS_Store

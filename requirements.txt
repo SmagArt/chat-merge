@@ -1,0 +1,7 @@
+beautifulsoup4>=4.12
+openai-whisper>=20231117
+customtkinter>=5.2
+imageio-ffmpeg>=0.4
+certifi
+tkinterdnd2
+# torch installed separately (CUDA/MPS/CPU depending on hardware)
