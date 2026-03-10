@@ -1065,8 +1065,9 @@ def _format_txt(messages: list, sources: list, contact: str) -> str:
         else:
             ts = "??:??:??"
 
-        lines.append(f"{ts} {msg['sender']}:")
-        for line in msg["text"].split("\n"):
+        text_lines = msg["text"].split("\n")
+        lines.append(f"{ts} {msg['sender']}: {text_lines[0]}")
+        for line in text_lines[1:]:
             lines.append(f"  {line}")
 
     return "\n".join(lines)
@@ -1392,12 +1393,13 @@ def process_folder(folder_path: str,
                 except Exception:
                     pass
                 if _gpu_est:
-                    # GPU ~5-10x faster than CPU
-                    _tmin = max(1, int(_pre_total * _k * 0.05))
-                    _tmax = max(1, int(_pre_total * _k * 0.3))
-                    if log_cb: log_cb(f"Примерное время расшифровки: {_tmin}–{_tmax} мин (модель '{model}', GPU)")
+                    # GPU: calibrated on RTX 3060 Ti (241 medium files = 7.6 min → 0.016 min/file/k)
+                    _tmin = max(1, int(_pre_total * _k * 0.01))
+                    _tmax = max(2, int(_pre_total * _k * 0.02))
+                    _tr = f"~{_tmin}" if _tmin == _tmax else f"{_tmin}–{_tmax}"
+                    if log_cb: log_cb(f"Примерное время расшифровки голосовых: {_tr} мин (модель '{model}', GPU)")
                 else:
-                    if log_cb: log_cb(f"Примерное время расшифровки: {max(1,int(_pre_total*_k*0.5))}–{max(2,int(_pre_total*_k*2))} мин (модель '{model}', CPU)")
+                    if log_cb: log_cb(f"Примерное время расшифровки: {max(1,int(_pre_total*_k*0.5))}–{max(2,int(_pre_total*_k*1))} мин (модель '{model}', CPU)")
             _is_frozen=getattr(__import__('sys'),'frozen',False)
             _dev='CPU'
             if not _is_frozen:
@@ -1507,7 +1509,20 @@ def process_folder(folder_path: str,
                     _voice_counter["total"] = _vn
                     _voice_counter["done"] = 0
                     if log_cb: log_cb(f"Голосовых в выбранном периоде: {_vn}")
-                    if log_cb: log_cb(f"Примерное время расшифровки: {max(1,int(_vn*_k2*0.5))}–{max(2,int(_vn*_k2*2))} мин (модель '{model}')")
+                    _gpu2 = False
+                    try:
+                        import torch as _te2
+                        if _te2.cuda.is_available() or (hasattr(_te2.backends,'mps') and _te2.backends.mps.is_available()):
+                            _gpu2 = True
+                    except Exception:
+                        pass
+                    if _gpu2:
+                        _tmin2 = max(1, int(_vn*_k2*0.01))
+                        _tmax2 = max(2, int(_vn*_k2*0.02))
+                        _tr2 = f"~{_tmin2}" if _tmin2 == _tmax2 else f"{_tmin2}–{_tmax2}"
+                        if log_cb: log_cb(f"Примерное время расшифровки голосовых: {_tr2} мин (модель '{model}', GPU)")
+                    else:
+                        if log_cb: log_cb(f"Примерное время расшифровки: {max(1,int(_vn*_k2*0.5))}–{max(2,int(_vn*_k2*1))} мин (модель '{model}', CPU)")
                     for j, m in enumerate(voice_msgs):
                         if _cancel_event and _cancel_event.is_set():
                             break

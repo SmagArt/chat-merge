@@ -3,14 +3,6 @@ import sys, os, threading, subprocess, re, platform, multiprocessing, json
 from pathlib import Path
 
 try:
-    import whisper as _w_pre
-    import imageio_ffmpeg as _f_pre
-except Exception:
-    # ImportError = not installed
-    # OSError = torch wrong architecture (x86_64 on arm64 Mac)
-    pass
-
-try:
     import customtkinter as ctk
 except ImportError:
     kw = {"creationflags": 0x08000000} if platform.system() == "Windows" else {}
@@ -909,10 +901,13 @@ class App(_BaseApp):
     def _done(self, ok: bool, cancelled: bool = False):
         self.running = False
         self.cbtn.pack_forget()
-        # Enable "Открыть папку" if file was created (even on cancel)
+        # Enable "Открыть папку": output file → green; fallback to source folder → muted
         if self.output_path and Path(self.output_path).exists():
             self.obtn.configure(state="normal", fg_color=T("GREEN"),
                                 hover_color=T("GREEN2"), text_color="white")
+        elif self.folder_var.get() and Path(self.folder_var.get()).exists():
+            self.obtn.configure(state="normal", fg_color=T("MUTED"),
+                                hover_color=T("BORDER"), text_color=T("SUB"))
         if cancelled:
             self.rbtn.configure(text="▶  Запустить", state="normal",
                                  fg_color=T("ACCENT"), text_color=T("TEXT"))
