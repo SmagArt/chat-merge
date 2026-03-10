@@ -8,7 +8,7 @@
 
 ---
 
-## Пошаговая сборка
+## Пошаговая сборка Windows
 
 ### Шаг 1 — Скачать Python для бандлинга
 Дважды кликни `prepare_installer.bat`.  
@@ -25,7 +25,7 @@
 
 ---
 
-## Что делает установщик
+## Что делает установщик Windows
 
 1. Устанавливает Python 3.13.2 в `{app}\python\` (тихо, без лишних окон)
 2. Запускает `setup_python.bat` — ставит все pip-пакеты
@@ -39,16 +39,35 @@
 
 ## Сборка macOS DMG
 
+### Требования
+- Python 3.13 (или 3.12) с установленными зависимостями (`pip install -r requirements.txt`)
+- Файл `merge_chat.icns` в корне проекта (уже включён в репо)
+
+### Сборка
 ```bash
-chmod +x build_mac.command
-./build_mac.command
+bash build_mac.command
 ```
 
-Готовый DMG появится в папке `dist_mac\`.
+Скрипт автоматически:
+1. Собирает `dist/MergeChat.app` через PyInstaller
+2. Создаёт staging-папку с симлинком на `/Applications`
+3. Упаковывает в `dist_mac/MergeChat_v2.0.dmg`
+
+Пользователь открывает DMG → перетаскивает MergeChat в папку Программы.  
+При первом запуске: правый клик на иконке → Открыть (обход Gatekeeper).
+
+### Иконка
+Иконка для Mac — `merge_chat.icns` (не `.ico`!).  
+Сгенерирована из `merge_chat_1024.png` с кропом 1024×1024 (оригинал 1036×1036 имеет белые поля).  
+При пересоздании: кропать `src.crop((0, 0, 1024, 1024))` перед генерацией icns.
+
+### Известные особенности macOS
+- Apple Silicon MPS иногда даёт NaN при расшифровке Whisper — реализован автофallback на CPU
+- Whisper medium на CPU (M4): ~10 мин на 69 файлов (без GPU-ускорения)
 
 ---
 
-## Структура файлов в установленном приложении
+## Структура файлов в установленном приложении (Windows)
 
 ```
 C:\Users\...\AppData\Local\Programs\Merge Chat\
@@ -57,7 +76,8 @@ C:\Users\...\AppData\Local\Programs\Merge Chat\
 ├── merge_chat_gui.py        <- GUI
 ├── launcher_win.vbs         <- запускалка (ярлык указывает сюда)
 ├── setup_python.bat         <- установщик пакетов (нужен для launcher)
-├── merge_chat.ico           <- иконка
+├── merge_chat.ico           <- иконка Windows
+├── merge_chat.icns          <- иконка macOS
 ├── merge_chat.log           <- лог обработки (создаётся при работе)
 ├── launch_log.txt           <- лог запуска (создаётся при запуске)
 ├── install_log.txt          <- лог установки пакетов
@@ -78,14 +98,15 @@ C:\Users\...\AppData\Local\Programs\Merge Chat\
 ### Что умеет
 - Объединяет переписки Telegram (JSON/HTML) и ВКонтакте (HTML) в TXT/Markdown
 - Расшифровывает голосовые через Whisper офлайн
-- GPU-ускорение: NVIDIA CUDA, Apple Silicon MPS
+- GPU-ускорение: NVIDIA CUDA, Apple Silicon MPS (с автофallback на CPU)
 
 ### Установка Windows
 Скачай MergeChat_Setup_v2.0.exe — Python и все зависимости установятся автоматически.
 При наличии NVIDIA видеокарты torch с CUDA установится автоматически.
 
 ### Установка macOS
-Скачай MergeChat_v2.0.dmg или собери из исходников через build_mac.command.
+Скачай MergeChat_v2.0.dmg, открой, перетащи MergeChat в Программы.
+При первом запуске: правый клик → Открыть.
 ```
 
 **Файлы релиза:**
@@ -97,8 +118,9 @@ C:\Users\...\AppData\Local\Programs\Merge Chat\
 
 ## Версионирование
 
-- Версия меняется в: `merge_chat_gui.py` (VERSION), `installer_windows.iss` (AppVersion), `README.md`, `BUILD_GUIDE.md`
-- До публикации на GitHub версию не менять
+Версия меняется в: `merge_chat_gui.py` (VERSION), `installer_windows.iss` (AppVersion), `README.md`, `BUILD_GUIDE.md`, `CLAUDE.md`
+
+До публикации на GitHub версию не менять.
 
 ---
 

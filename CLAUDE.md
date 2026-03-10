@@ -30,11 +30,16 @@ GitHub: github.com/SmagArt/chat-merge (v2.0 — первый публичный 
 
 ### Что НЕ тестировалось
 - MergeChat_Setup_v2.0.exe на чистой машине без Python
-- DMG на Mac (build_mac.command)
+
+### Протестировано (март 2026)
+- macOS (Mac mini M4): сборка .app + DMG через build_mac.command ✓
+- Apple Silicon MPS: NaN fallback на CPU работает, 69 файлов за ~11 мин ✓
+- merge_chat.icns: иконка корректная (кроп 1024×1024 из PNG)
 
 ### Известные ограничения
 - Голосовые из ВКонтакте не расшифровываются (VK не включает аудио в экспорт)
 - Python 3.14 НЕ поддерживается PyTorch/Whisper
+- Apple Silicon MPS: Whisper medium иногда даёт NaN → автофallback на CPU (реализовано в v2.0)
 
 ---
 

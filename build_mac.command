@@ -1,8 +1,4 @@
 #!/bin/bash
-# Merge Chat v2.0 — build .app via PyInstaller
-# Produces: dist/MergeChat.app
-# For DMG: drag dist/MergeChat.app to Disk Utility and create image manually,
-# or use: hdiutil create -volname MergeChat -srcfolder dist/MergeChat.app -ov -format UDZO MergeChat_v2.0.dmg
 cd "$(dirname "$0")"
 LOG="$(pwd)/build_log.txt"
 echo "Build: $(date)" > "$LOG"
@@ -21,9 +17,13 @@ echo "[OK] $("$PYTHON" --version)" | tee -a "$LOG"
 "$PYTHON" -c "import PyInstaller" &>/dev/null 2>&1 || \
     "$PYTHON" -m pip install pyinstaller -q --break-system-packages
 
+ICON_ARG=""
+[ -f "merge_chat.icns" ] && ICON_ARG="--icon merge_chat.icns"
+
 "$PYTHON" -m PyInstaller \
     --noconfirm --clean --onedir --windowed \
     --name "MergeChat" \
+    $ICON_ARG \
     --add-data "merge_chat.py:." \
     --add-data "merge_chat.ico:." \
     --collect-all whisper \
@@ -32,13 +32,32 @@ echo "[OK] $("$PYTHON" --version)" | tee -a "$LOG"
     --hidden-import whisper.audio \
     merge_chat_gui.py 2>&1 | tee -a "$LOG"
 
-echo ""
-if [ -d "dist/MergeChat.app" ]; then
-    echo "[OK] dist/MergeChat.app" | tee -a "$LOG"
-    echo ""
-    echo "To create DMG:"
-    echo "  hdiutil create -volname MergeChat -srcfolder dist/MergeChat.app -ov -format UDZO dist_mac/MergeChat_v2.0.dmg"
-else
+if [ ! -d "dist/MergeChat.app" ]; then
     echo "[X] Build failed — see $LOG"
+    read -rp "Enter..."; exit 1
+fi
+echo "[OK] dist/MergeChat.app built" | tee -a "$LOG"
+
+# Build DMG with Applications symlink (drag-and-drop install)
+mkdir -p dist_mac
+STAGING="$(pwd)/dist_mac_staging"
+rm -rf "$STAGING"
+mkdir -p "$STAGING"
+cp -r dist/MergeChat.app "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+
+hdiutil create \
+    -volname "Merge Chat" \
+    -srcfolder "$STAGING" \
+    -ov -format UDZO \
+    dist_mac/MergeChat_v2.0.dmg 2>&1 | tee -a "$LOG"
+
+rm -rf "$STAGING"
+
+if [ -f "dist_mac/MergeChat_v2.0.dmg" ]; then
+    echo ""
+    echo "[OK] dist_mac/MergeChat_v2.0.dmg ready" | tee -a "$LOG"
+else
+    echo "[X] DMG creation failed" | tee -a "$LOG"
 fi
 read -rp "Enter..."

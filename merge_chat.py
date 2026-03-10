@@ -384,7 +384,35 @@ def transcribe(file_path: Path) -> Optional[str]:
                 return None
 
         if _exc_box[0] is not None:
-            raise _exc_box[0]
+            # MPS NaN fallback: Apple Silicon MPS sometimes produces NaN even in fp32.
+            # Detect by "nan" in error text and retry on CPU.
+            _is_mps_nan = (
+                "nan" in str(_exc_box[0]).lower()
+                and str(getattr(_whisper_cache, "device", "")).startswith("mps")
+            )
+            if _is_mps_nan:
+                print(f"  [!] MPS NaN detected — falling back to CPU for all remaining files")
+                try:
+                    import torch as _tt
+                    _whisper_cache = whisper.load_model(CFG.whisper_model, device="cpu")
+                    _loaded_model_name = CFG.whisper_model
+                    print(f"  Model reloaded on CPU OK.")
+                    # Retry this file on CPU
+                    _exc_box[0] = None
+                    _result_box[0] = None
+                    _use_fp16 = False
+                    _t2 = _thr.Thread(target=_do_transcribe, daemon=True)
+                    _t2.start()
+                    while _t2.is_alive():
+                        _t2.join(timeout=0.3)
+                        if _cancel_event and _cancel_event.is_set():
+                            return None
+                    if _exc_box[0] is not None:
+                        raise _exc_box[0]
+                except Exception as _cpu_err:
+                    raise _cpu_err
+            else:
+                raise _exc_box[0]
 
         result = _result_box[0]
         text = (result.get("text") or "").strip() or None
