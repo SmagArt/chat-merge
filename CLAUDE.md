@@ -1,13 +1,13 @@
-# CLAUDE.md — Merge Chat v2.0
+# CLAUDE.md — Merge Chat v2.1
 
 ## Контекст проекта
 Python GUI-утилита: объединяет переписки Telegram (JSON/HTML) и ВКонтакте (HTML) в TXT или MD.
 Расшифровывает голосовые через OpenAI Whisper офлайн.
-GitHub: github.com/SmagArt/chat-merge (v2.0 — первый публичный релиз)
+GitHub: github.com/SmagArt/chat-merge (v2.1 — bugfix release)
 
 ---
 
-## Текущее состояние (март 2026, v2.0) — ФИНАЛЬНОЕ
+## Текущее состояние (март 2026, v2.1)
 
 ### Что РАБОТАЕТ (проверено на реальных данных)
 - Парсинг TG JSON, TG HTML, VK HTML

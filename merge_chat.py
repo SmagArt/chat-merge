@@ -58,7 +58,10 @@ def _fix_ssl():
         _os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
     except ImportError:
         pass
-    _ssl._create_default_https_context = _ssl._create_unverified_context
+    # Отключаем верификацию SSL только на macOS (Python from python.org)
+    import sys as _sysssl
+    if _sysssl.platform == "darwin":
+        _ssl._create_default_https_context = _ssl._create_unverified_context
 
 _fix_ssl()
 
@@ -218,9 +221,7 @@ def _progress_bar(done: int, total: int, w: int = 25) -> str:
 def transcribe(file_path: Path) -> Optional[str]:
     if CFG.skip_transcribe:
         return None  # first-pass mode: no transcription
-    print(f"  [DBG] transcribe called: use_whisper={CFG.use_whisper}, file={file_path}")
     if not CFG.use_whisper or not file_path or not file_path.exists():
-        print(f"  [DBG] transcribe SKIP: use_whisper={CFG.use_whisper}, exists={file_path.exists() if file_path else 'N/A'}")
         return None
 
     # Check if user pressed Cancel
@@ -229,7 +230,6 @@ def transcribe(file_path: Path) -> Optional[str]:
 
     cache_key = str(file_path.resolve())
     if cache_key in _transcribe_cache:
-        print(f"  [DBG] transcribe CACHED: {file_path.name}")
         return _transcribe_cache[cache_key]
 
     global _whisper_cache, _loaded_model_name
@@ -480,7 +480,6 @@ def media_label(file_path: Optional[Path], is_video: bool = False) -> str:
     # Cancel check — stop immediately if user pressed Cancel
     if _cancel_event and _cancel_event.is_set():
         return f"[{icon} {kind} — отменено]"
-    print(f"  [DBG] media_label: OK, use_whisper={CFG.use_whisper}, file={file_path.name}")
     if is_video:
         tmp = extract_audio(file_path)
         text = transcribe(tmp) if tmp else None
@@ -1113,15 +1112,24 @@ def _format_markdown(messages: list, sources: list, contact: str) -> str:
 
         sender_md = f"**{msg['sender']}**"
         text_lines = msg["text"].split("\n")
-        # Первая строка
-        first = text_lines[0]
-        lines.append(f"`{ts}` {sender_md}: {first}")
-        # Остальные строки с отступом
-        for line in text_lines[1:]:
-            if line.startswith("  ┌ "):
-                lines.append(f"> {line.strip()}")
+        # Отделяем цитаты/пересылки (они идут первыми) от основного текста
+        prefix_lines = []
+        content_start = 0
+        for idx, line in enumerate(text_lines):
+            if line.startswith("  ┌ ") or line.startswith("[переслано"):
+                prefix_lines.append(line)
+                content_start = idx + 1
             else:
-                lines.append(f"  {line}")
+                break
+        content_lines = text_lines[content_start:]
+        # Цитаты и пересылки — blockquote перед сообщением
+        for line in prefix_lines:
+            lines.append(f"> {line.strip()}")
+        # Основная строка с меткой времени
+        first = content_lines[0] if content_lines else ""
+        lines.append(f"`{ts}` {sender_md}: {first}")
+        for line in content_lines[1:]:
+            lines.append(f"  {line}")
         lines.append("")
 
     return "\n".join(lines)
@@ -1405,10 +1413,8 @@ def process_folder(folder_path: str,
                         try:
                             import torch_directml as _tdml; _dev='AMD/Intel (DirectML)'
                         except ImportError: pass
-                        if _dev == 'CPU':
-                            if log_cb: log_cb(f"  [DBG] torch {_tv} — GPU недоступен, используется CPU")
-                except ImportError as _ie:
-                    if log_cb: log_cb(f"  [DBG] torch import failed: {_ie}")
+                except ImportError:
+                    pass
             _is_frozen_win = _is_frozen and __import__('sys').platform == 'win32'
             if log_cb: log_cb(f"  Устройство расшифровки: {_dev}" + (' (exe-сборка Windows — GPU недоступен)' if _is_frozen_win else ''))
         else:
@@ -1439,13 +1445,25 @@ def process_folder(folder_path: str,
         if needs_date_filter:
             CFG.skip_transcribe = True
 
+        seen_ids: set = set()
         for i, v in enumerate(valid):
             if _cancel_event and _cancel_event.is_set():
                 if log_cb: log_cb("--- Отменено ---")
                 return None
             msgs, c, src = load_chat_folder(v)
-            all_messages.extend(msgs)
             if src: sources.extend(src if isinstance(src, list) else [src])
+            new_cnt, dup_cnt = 0, 0
+            for msg in msgs:
+                mid = msg.get("id")
+                if mid and mid in seen_ids:
+                    dup_cnt += 1
+                else:
+                    if mid:
+                        seen_ids.add(mid)
+                    all_messages.append(msg)
+                    new_cnt += 1
+            if dup_cnt:
+                if log_cb: log_cb(f"  Дублей пропущено: {dup_cnt}")
             if c:
                 _msg_count = len([m for m in msgs if m.get("sender") != CFG.my_name])
                 if _msg_count > _best_contact_count:
@@ -1510,12 +1528,12 @@ def process_folder(folder_path: str,
         # (чтобы не расшифровывать файлы вне выбранного периода)
         voice_paths_in_period: set = set()
         for m in all_messages:
-            mp = m.get("media_path")
+            mp = m.get("_voice_path")
             if mp:
                 p = Path(mp) if not isinstance(mp, Path) else mp
-                if p.suffix.lower() in (".ogg", ".oga", ".mp4") and p.exists():
+                if p.exists():
                     voice_paths_in_period.add(p.resolve())
-        # Fallback: если у сообщений нет media_path — сканируем папки (без фильтра)
+        # Fallback: если у сообщений нет _voice_path — сканируем папки (без фильтра)
         if not voice_paths_in_period and not (date_from or date_to):
             for v in valid:
                 for pat in ("voice_messages/*.ogg","voice_messages/*.oga",
@@ -1559,7 +1577,7 @@ def process_folder(folder_path: str,
         if not contact or contact.strip() in (".", "", ".."):
             contact = valid[0].name if valid[0].name not in (".", "..") else "чат"
         import re as _re
-        safe = _re.sub(r'[/*?"<>|.]', "", contact.split()[0]).strip()
+        safe = _re.sub(r'[\\/*?:"<>|]', "", contact.split()[0]).strip()
         if not safe:
             safe = "chat"
 

@@ -54,7 +54,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.0"
+VERSION = "2.1"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -92,15 +92,6 @@ SCRIPT = find_script()
 _cancel_event = threading.Event()
 
 
-# Windows taskbar icon fix
-import sys as _sys_tb
-if _sys_tb.platform == 'win32':
-    try:
-        import ctypes as _ct
-        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SmagArt.MergeChat.1.9')
-    except Exception:
-        pass
-
 class App(_BaseApp):
     def __init__(self):
         # Taskbar icon fix: Windows needs AppUserModelID set BEFORE window creation
@@ -132,7 +123,7 @@ class App(_BaseApp):
         self.folder_var  = ctk.StringVar(value="")
         self.author_var  = ctk.StringVar(value=self._cfg.get("author", "Вы"))
         self.model_var   = ctk.StringVar(value=self._cfg.get("model", "small"))
-        self.merge_on    = False
+        self.merge_on    = self._cfg.get("merge_on", False)
         self.fmt_md      = self._cfg.get("fmt_md", False)
         self.date_from       = ctk.StringVar(value="")   # не сохраняем — всегда пустой при старте
         self.date_to         = ctk.StringVar(value="")
@@ -193,11 +184,12 @@ class App(_BaseApp):
     def _save_cfg(self):
         try:
             self._cfg.update({
-                "author": self.author_var.get(),
-                "model":  self.model_var.get(),
-                "theme":  _theme,
-                "fmt_md": self.fmt_md,
-                "recent": self._recent,
+                "author":   self.author_var.get(),
+                "model":    self.model_var.get(),
+                "theme":    _theme,
+                "fmt_md":   self.fmt_md,
+                "merge_on": self.merge_on,
+                "recent":   self._recent,
                 # dates not saved — always empty on start
             })
             self._cfg_path.write_text(
@@ -233,14 +225,6 @@ class App(_BaseApp):
         if Path(path).is_dir():
             self.folder_var.set(path)
             self.flbl.configure(text=path, text_color=T("TEXT"))
-
-    def _toggle_theme(self):
-        global _theme
-        _theme = "light" if _theme == "dark" else "dark"
-        ctk.set_appearance_mode(_theme)
-        self.configure(fg_color=T("BG"))
-        self._theme_btn.configure(text="☀️" if _theme == "light" else "🌙")
-        self._save_cfg()
 
     def _toggle_fmt(self):
         self.fmt_md = not self.fmt_md
@@ -367,9 +351,14 @@ class App(_BaseApp):
         r3 = ctk.CTkFrame(si, fg_color="transparent"); r3.pack(fill="x", pady=5)
         ctk.CTkLabel(r3, text="Объединять подряд идущие", font=self._f(13),
                      text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
-        self.mbtn = ctk.CTkButton(r3, text="○ ВЫКЛ", width=90, height=30,
+        _m_text = "● ВКЛ"  if self.merge_on else "○ ВЫКЛ"
+        _m_fg   = T("GREEN") if self.merge_on else T("MUTED")
+        _m_hov  = T("GREEN2") if self.merge_on else T("BORDER")
+        _m_tc   = T("TEXT") if self.merge_on else T("SUB")
+        self.mbtn = ctk.CTkButton(r3, text=_m_text, width=90, height=30,
                                    font=self._f(12, "bold"),
-                                   fg_color=T("MUTED"), hover_color=T("BORDER"),
+                                   fg_color=_m_fg, hover_color=_m_hov,
+                                   text_color=_m_tc,
                                    corner_radius=7, command=self._toggle_merge)
         self.mbtn.pack(side="left")
 

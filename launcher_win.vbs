@@ -86,7 +86,7 @@ If Not fso.FileExists(flagFile) Then
     tf.WriteLine "wmic path win32_VideoController get name 2>nul | findstr /i nvidia >nul 2>&1"
     tf.WriteLine "if %ERRORLEVEL% NEQ 0 goto :done"
     tf.WriteLine "echo %DATE% %TIME% Installing torch cu124... >> ""%LOG%"""
-    tf.WriteLine py & " -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall -q >> ""%LOG%"" 2>&1"
+    tf.WriteLine pyS & " -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall -q >> ""%LOG%"" 2>&1"
     tf.WriteLine "echo %DATE% %TIME% Done, exit=%ERRORLEVEL% >> ""%LOG%"""
     tf.WriteLine ":done"
     tf.Close

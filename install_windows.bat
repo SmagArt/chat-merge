@@ -40,7 +40,7 @@ REM Check NVIDIA
 wmic path win32_VideoController get name 2>nul | findstr /i nvidia >nul
 if %errorlevel%==0 (
     echo NVIDIA GPU detected - installing PyTorch CUDA...
-    "!PYTHON!" -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --force-reinstall -q
+    "!PYTHON!" -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall -q
 ) else (
     echo Installing PyTorch CPU...
     "!PYTHON!" -m pip install torch -q

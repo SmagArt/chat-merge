@@ -1,4 +1,4 @@
-# BUILD_GUIDE.md — Merge Chat v2.0
+# BUILD_GUIDE.md — Merge Chat v2.1
 
 ## Что нужно для сборки Windows установщика
 
@@ -17,7 +17,7 @@
 
 ### Шаг 2 — Собрать установщик
 Открой `installer_windows.iss` в Inno Setup → нажми Build → Compile.  
-Готовый файл появится в папке `dist_installer\MergeChat_Setup_v2.0.exe`.
+Готовый файл появится в папке `dist_installer\MergeChat_Setup_v2.1.exe`.
 
 ### Шаг 3 — Проверить на чистой системе
 Удали папку `C:\Users\...\AppData\Local\Programs\Merge Chat` если есть.  
@@ -51,7 +51,7 @@ bash build_mac.command
 Скрипт автоматически:
 1. Собирает `dist/MergeChat.app` через PyInstaller
 2. Создаёт staging-папку с симлинком на `/Applications`
-3. Упаковывает в `dist_mac/MergeChat_v2.0.dmg`
+3. Упаковывает в `dist_mac/MergeChat_v2.1.dmg`
 
 Пользователь открывает DMG → перетаскивает MergeChat в папку Программы.  
 При первом запуске: правый клик на иконке → Открыть (обход Gatekeeper).
@@ -89,11 +89,11 @@ C:\Users\...\AppData\Local\Programs\Merge Chat\
 
 ## GitHub Release — шаблон
 
-**Название:** `v2.0 — Merge Chat`
+**Название:** `v2.1 — Merge Chat`
 
 **Описание:**
 ```
-## Merge Chat v2.0 — первый публичный релиз
+## Merge Chat v2.1 — первый публичный релиз
 
 ### Что умеет
 - Объединяет переписки Telegram (JSON/HTML) и ВКонтакте (HTML) в TXT/Markdown
@@ -101,17 +101,17 @@ C:\Users\...\AppData\Local\Programs\Merge Chat\
 - GPU-ускорение: NVIDIA CUDA, Apple Silicon MPS (с автофallback на CPU)
 
 ### Установка Windows
-Скачай MergeChat_Setup_v2.0.exe — Python и все зависимости установятся автоматически.
+Скачай MergeChat_Setup_v2.1.exe — Python и все зависимости установятся автоматически.
 При наличии NVIDIA видеокарты torch с CUDA установится автоматически.
 
 ### Установка macOS
-Скачай MergeChat_v2.0.dmg, открой, перетащи MergeChat в Программы.
+Скачай MergeChat_v2.1.dmg, открой, перетащи MergeChat в Программы.
 При первом запуске: правый клик → Открыть.
 ```
 
 **Файлы релиза:**
-- `MergeChat_Setup_v2.0.exe` — Windows установщик
-- `MergeChat_v2.0.dmg` — macOS DMG
+- `MergeChat_Setup_v2.1.exe` — Windows установщик
+- `MergeChat_v2.1.dmg` — macOS DMG
 - `MergeChat-2.0-source.zip` — исходники
 
 ---
@@ -129,8 +129,8 @@ C:\Users\...\AppData\Local\Programs\Merge Chat\
 ```bash
 cd папка-проекта
 git add .
-git commit -m "v2.0 — initial public release"
+git commit -m "v2.1 — initial public release"
 git push origin main
 ```
 
-Затем на GitHub: Releases → Draft new release → Tag: v2.0 → загрузить файлы.
+Затем на GitHub: Releases → Draft new release → Tag: v2.1 → загрузить файлы.
