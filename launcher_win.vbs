@@ -54,21 +54,30 @@ End If
 Dim pyS : pyS = S(py)
 Log "python=" & pyS
 
-' --- Install packages if missing ---
-Dim chk : chk = RunQ(pyS & " -c ""import customtkinter""")
-Log "packages=" & chk
-If chk <> 0 Then
-    Dim bat : bat = scriptDir & "\setup_python.bat"
-    If Not fso.FileExists(bat) Then
-        MsgBox "setup_python.bat not found!", 16, "Merge Chat"
-        WScript.Quit 1
-    End If
-    RunQ "powershell -NoProfile -WindowStyle Hidden -Command ""Start-Process cmd -ArgumentList '/c """ & S(bat) & """' -Wait -WindowStyle Hidden"""
-    chk = RunQ(pyS & " -c ""import customtkinter""")
+' --- Install packages if missing (check once, then skip via flag) ---
+Dim pkgsFlag : pkgsFlag = scriptDir & "\pkgs_ok.flag"
+If Not fso.FileExists(pkgsFlag) Then
+    Dim chk : chk = RunQ(pyS & " -c ""import customtkinter""")
+    Log "packages=" & chk
     If chk <> 0 Then
-        MsgBox "Installation failed. See install_log.txt", 16, "Merge Chat"
-        WScript.Quit 1
+        Dim bat : bat = scriptDir & "\setup_python.bat"
+        If Not fso.FileExists(bat) Then
+            MsgBox "setup_python.bat not found!", 16, "Merge Chat"
+            WScript.Quit 1
+        End If
+        RunQ "powershell -NoProfile -WindowStyle Hidden -Command ""Start-Process cmd -ArgumentList '/c """ & S(bat) & """' -Wait -WindowStyle Hidden"""
+        chk = RunQ(pyS & " -c ""import customtkinter""")
+        If chk <> 0 Then
+            MsgBox "Installation failed. See install_log.txt", 16, "Merge Chat"
+            WScript.Quit 1
+        End If
     End If
+    Dim pf : Set pf = fso.CreateTextFile(pkgsFlag, True)
+    pf.WriteLine Now()
+    pf.Close
+    Log "pkgs_ok flag written"
+Else
+    Log "pkgs_ok flag found, skipping package check"
 End If
 
 ' --- CUDA check: only once, skip if flag exists ---
