@@ -14,7 +14,7 @@ GitHub: github.com/SmagArt/chat-merge (v2.1 — bugfix release)
 - Объединение нескольких папок одного контакта
 - Расшифровка голосовых через Whisper
 - **GPU: RTX 3060 Ti — 15 файлов medium за 3 мин (CPU было бы ~30 мин)**
-- GUI v2.0: выбор папки, drag & drop, история 5 папок, фильтр по датам
+- GUI v2.1: выбор папки, drag & drop, история 5 папок, фильтр по датам
 - Форматы вывода: TXT и Markdown
 - Прогресс-бар, кнопка копирования лога
 - Оценка времени с учётом GPU/CPU (реалистичная)
@@ -29,7 +29,7 @@ GitHub: github.com/SmagArt/chat-merge (v2.1 — bugfix release)
 - **subprocess CREATE_NO_WINDOW везде, включая внутренние вызовы whisper/ffmpeg**
 
 ### Что НЕ тестировалось
-- MergeChat_Setup_v2.0.exe на чистой машине без Python
+- MergeChat_Setup_v2.1.exe на чистой машине без Python
 
 ### Протестировано (март 2026)
 - macOS (Mac mini M4): сборка .app + DMG через build_mac.command ✓
@@ -48,7 +48,7 @@ GitHub: github.com/SmagArt/chat-merge (v2.1 — bugfix release)
 | Файл | Назначение |
 |------|-----------|
 | `merge_chat.py` | Основной скрипт + process_folder() API |
-| `merge_chat_gui.py` | GUI v2.0 |
+| `merge_chat_gui.py` | GUI v2.1 |
 | `installer_windows.iss` | Inno Setup: bundled Python 3.13.2 |
 | `prepare_installer.bat` | Скачивает python-3.13.2-amd64.exe для Inno Setup |
 | `setup_python.bat` | pip-пакеты + CUDA torch при установке |
@@ -177,5 +177,5 @@ self.geometry(f"{W}x{H}+{(sw-W)//2}+{max(20,(sh-H)//2-20)}")
 
 ## Версионирование
 
-v2.0 — первый публичный релиз на GitHub.
+v2.1 — текущий публичный релиз (Windows).
 При изменении версии обновлять: `merge_chat_gui.py` (VERSION), `installer_windows.iss` (AppVersion), `README.md`, `BUILD_GUIDE.md`, `CLAUDE.md`.

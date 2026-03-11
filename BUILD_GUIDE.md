@@ -112,7 +112,7 @@ C:\Users\...\AppData\Local\Programs\Merge Chat\
 **Файлы релиза:**
 - `MergeChat_Setup_v2.1.exe` — Windows установщик
 - `MergeChat_v2.1.dmg` — macOS DMG
-- `MergeChat-2.0-source.zip` — исходники
+- `MergeChat-2.1-source.zip` — исходники
 
 ---
 

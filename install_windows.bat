@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 chcp 65001 >nul
 
-REM Merge Chat v2.0 - install for existing Python users
+REM Merge Chat v2.1 - install for existing Python users
 
 set "PYTHON="
 

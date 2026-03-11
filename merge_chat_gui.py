@@ -1,4 +1,4 @@
-"""Merge Chat — GUI v2.0"""
+"""Merge Chat — GUI v2.1"""
 import sys, os, threading, subprocess, re, platform, multiprocessing, json
 from pathlib import Path
 
