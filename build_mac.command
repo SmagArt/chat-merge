@@ -50,13 +50,13 @@ hdiutil create \
     -volname "Merge Chat" \
     -srcfolder "$STAGING" \
     -ov -format UDZO \
-    dist_mac/MergeChat_v2.0.dmg 2>&1 | tee -a "$LOG"
+    dist_mac/MergeChat_v2.1.dmg 2>&1 | tee -a "$LOG"
 
 rm -rf "$STAGING"
 
-if [ -f "dist_mac/MergeChat_v2.0.dmg" ]; then
+if [ -f "dist_mac/MergeChat_v2.1.dmg" ]; then
     echo ""
-    echo "[OK] dist_mac/MergeChat_v2.0.dmg ready" | tee -a "$LOG"
+    echo "[OK] dist_mac/MergeChat_v2.1.dmg ready" | tee -a "$LOG"
 else
     echo "[X] DMG creation failed" | tee -a "$LOG"
 fi
