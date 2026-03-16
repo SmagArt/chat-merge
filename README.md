@@ -1,4 +1,4 @@
-# Merge Chat v2.1
+# Merge Chat v2.1.1.1
 
 Объединяет переписки **Telegram** и **ВКонтакте** в один файл TXT или Markdown.  
 Расшифровывает голосовые сообщения офлайн через OpenAI Whisper.  
@@ -25,7 +25,7 @@
 ### Windows
 
 **Вариант 1 — установщик (рекомендуется):**
-1. Скачай `MergeChat_Setup_v2.1.exe` из [Releases](https://github.com/SmagArt/chat-merge/releases)
+1. Скачай `MergeChat_Setup_v2.1.1.exe` из [Releases](https://github.com/SmagArt/chat-merge/releases)
 2. Запусти и следуй инструкциям
 3. Python и все пакеты установятся автоматически
 4. При первом запуске автоматически определится и установится GPU-версия PyTorch
@@ -37,7 +37,7 @@
 ### macOS
 
 **Вариант 1 — готовый DMG (рекомендуется):**
-1. Скачай `MergeChat_v2.1.dmg` из [Releases](https://github.com/SmagArt/chat-merge/releases)
+1. Скачай `MergeChat_v2.1.1.dmg` из [Releases](https://github.com/SmagArt/chat-merge/releases)
 2. Открой DMG, перетащи MergeChat в папку Программы
 3. При первом запуске: правый клик → Открыть (обход Gatekeeper)
 
@@ -47,7 +47,7 @@ git clone https://github.com/SmagArt/chat-merge.git
 cd chat-merge
 bash build_mac.command
 ```
-Скрипт соберёт `.app` и создаст `dist_mac/MergeChat_v2.1.dmg` автоматически.
+Скрипт соберёт `.app` и создаст `dist_mac/MergeChat_v2.1.1.dmg` автоматически.
 
 ---
 

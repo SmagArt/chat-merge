@@ -46,7 +46,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.1"
+VERSION = "2.1.1"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -144,10 +144,18 @@ class App(_BaseApp):
         if _HAS_DND:
             try:
                 _TkDnD._require(self)
-                self.drop_target_register(DND_FILES)
-                self.dnd_bind("<<Drop>>", self._on_dnd_drop)
+                self._register_dnd_recursive(self)
             except Exception:
                 pass
+
+    def _register_dnd_recursive(self, widget):
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_dnd_drop)
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._register_dnd_recursive(child)
 
     def _find_icon(self):
         """Ищем merge_chat.ico рядом со скриптом или в _MEIPASS (PyInstaller)"""
