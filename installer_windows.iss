@@ -49,7 +49,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{sys}\wscript.exe"; Parameters: """
 
 [Run]
 ; Step 1: Install Python silently (full installer, includes tkinter)
-Filename: "{tmp}\python-3.13.2-amd64.exe"; Parameters: "/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 TargetDir={app}\python"; StatusMsg: "Установка Python..."; Flags: waituntilterminated
+Filename: "{tmp}\python-3.13.2-amd64.exe"; Parameters: "/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 TargetDir=""{app}\python"""; StatusMsg: "Установка Python..."; Flags: waituntilterminated
 
 ; Step 2: Install packages (GUI progress via setup_python.bat)
 Filename: "{app}\setup_python.bat"; WorkingDir: "{app}"; StatusMsg: "Установка пакетов..."; Flags: waituntilterminated runhidden
