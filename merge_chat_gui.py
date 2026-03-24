@@ -46,7 +46,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.1.1"
+VERSION = "2.2"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -117,6 +117,9 @@ class App(_BaseApp):
         self.model_var   = ctk.StringVar(value=self._cfg.get("model", "small"))
         self.merge_on    = self._cfg.get("merge_on", False)
         self.fmt_md      = self._cfg.get("fmt_md", False)
+        self.show_ts     = self._cfg.get("show_ts", True)
+        # split_mode: "none" / "month" / "year"
+        self.split_mode  = self._cfg.get("split_mode", "none")
         self.date_from       = ctk.StringVar(value="")   # не сохраняем — всегда пустой при старте
         self.date_to         = ctk.StringVar(value="")
         self.running     = False
@@ -187,7 +190,9 @@ class App(_BaseApp):
                 "author":   self.author_var.get(),
                 "model":    self.model_var.get(),
                 "theme":    _theme,
-                "fmt_md":   self.fmt_md,
+                "fmt_md":    self.fmt_md,
+                "show_ts":   self.show_ts,
+                "split_mode": self.split_mode,
                 "merge_on": self.merge_on,
                 "recent":   self._recent,
                 # dates not saved — always empty on start
@@ -232,6 +237,24 @@ class App(_BaseApp):
             self._fmt_btn.configure(text="📝 MD", fg_color=T("ACCENT"), text_color="white")
         else:
             self._fmt_btn.configure(text="📄 TXT", fg_color=T("MUTED"), text_color=T("SUB"))
+
+    def _toggle_split(self):
+        cycle = {"none": "month", "month": "year", "year": "none"}
+        self.split_mode = cycle[self.split_mode]
+        labels = {"none":  ("📄 один файл",  T("SURFACE"), T("BORDER"), T("SUB")),
+                  "month": ("📅 по месяцам", T("ACCENT"),  T("ACCENT"), "white"),
+                  "year":  ("📆 по годам",   T("GREEN"),   T("GREEN"),  "white")}
+        txt, fg, bc, tc = labels[self.split_mode]
+        self._split_btn.configure(text=txt, fg_color=fg, border_color=bc, text_color=tc)
+
+    def _toggle_ts(self):
+        self.show_ts = not self.show_ts
+        if self.show_ts:
+            self._ts_btn.configure(text="🕐 ВКЛ", fg_color=T("SURFACE"),
+                                   border_color=T("BORDER"), text_color=T("SUB"))
+        else:
+            self._ts_btn.configure(text="🕐 ВЫКЛ", fg_color=T("ACCENT"),
+                                   border_color=T("ACCENT"), text_color="white")
 
     def _build(self):
         P = 28
@@ -365,7 +388,7 @@ class App(_BaseApp):
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
 
         r4 = ctk.CTkFrame(si, fg_color="transparent"); r4.pack(fill="x", pady=5)
-        ctk.CTkLabel(r4, text="Формат вывода", font=self._f(13),
+        ctk.CTkLabel(r4, text="Формат · Метки времени", font=self._f(13),
                      text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
         fmt_text = "📝 MD" if self.fmt_md else "📄 TXT"
         fmt_fg   = T("ACCENT") if self.fmt_md else T("MUTED")
@@ -375,7 +398,16 @@ class App(_BaseApp):
             fg_color=fmt_fg, hover_color=T("ACCENT2"),
             text_color=fmt_tc, corner_radius=7, command=self._toggle_fmt)
         self._fmt_btn.pack(side="left")
-        ctk.CTkLabel(r4, text="  TXT — простой текст · MD — Markdown (Obsidian, Notion)",
+        _ts_fg  = T("SURFACE") if self.show_ts else T("ACCENT")
+        _ts_bc  = T("BORDER")  if self.show_ts else T("ACCENT")
+        _ts_tc  = T("SUB")     if self.show_ts else "white"
+        _ts_txt = "🕐 ВКЛ"    if self.show_ts else "🕐 ВЫКЛ"
+        self._ts_btn = ctk.CTkButton(
+            r4, text=_ts_txt, width=90, height=30, font=self._f(12, "bold"),
+            fg_color=_ts_fg, hover_color=T("ACCENT2"), border_color=_ts_bc, border_width=1,
+            text_color=_ts_tc, corner_radius=7, command=self._toggle_ts)
+        self._ts_btn.pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(r4, text="  TXT/MD · время сообщений вкл/выкл",
                      font=self._f(10), text_color=T("SUB")).pack(side="left", padx=(8, 0))
 
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
@@ -395,8 +427,17 @@ class App(_BaseApp):
                       fg_color=T("MUTED"), hover_color=T("BORDER"),
                       text_color=T("SUB"), corner_radius=7,
                       command=self._clear_dates).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(df, text="пусто = вся переписка",
-                     font=self._f(10), text_color=T("SUB")).pack(side="left")
+        _split_labels = {
+            "none":  ("📄 один файл",  T("SURFACE"), T("BORDER"), T("SUB")),
+            "month": ("📅 по месяцам", T("ACCENT"),  T("ACCENT"), "white"),
+            "year":  ("📆 по годам",   T("GREEN"),   T("GREEN"),  "white"),
+        }
+        _sp_txt, _sp_fg, _sp_bc, _sp_tc = _split_labels[self.split_mode]
+        self._split_btn = ctk.CTkButton(
+            df, text=_sp_txt, width=120, height=30, font=self._f(11, "bold"),
+            fg_color=_sp_fg, hover_color=T("ACCENT2"), border_color=_sp_bc, border_width=1,
+            text_color=_sp_tc, corner_radius=7, command=self._toggle_split)
+        self._split_btn.pack(side="left", padx=(8, 0))
 
         self._gap(16)
 
@@ -727,6 +768,9 @@ class App(_BaseApp):
         if self.merge_on:
             self.mbtn.configure(text="● ВКЛ", fg_color=T("GREEN"), hover_color=T("GREEN2"),
                                  text_color=T("TEXT"))
+            self.plbl.configure(text="⚠ Объединение — только для диалогов, не для групп!",
+                                 text_color="#f59e0b")
+            self.after(4000, lambda: self.plbl.configure(text="", text_color=T("SUB")))
         else:
             self.mbtn.configure(text="○ ВЫКЛ", fg_color=T("MUTED"), hover_color=T("BORDER"),
                                  text_color=T("SUB"))
@@ -895,6 +939,8 @@ class App(_BaseApp):
                     progress_cb=lambda p: self.after(0, self.pbar.set, min(float(p), 1.0)),
                     date_from=self.date_from.get().strip(),
                     date_to=self.date_to.get().strip(),
+                    show_timestamps=self.show_ts,
+                    split_mode=self.split_mode,
                 )
                 cancelled = _cancel_event.is_set()
                 self.after(0, self._done, bool(out), cancelled)

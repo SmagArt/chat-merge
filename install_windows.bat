@@ -21,7 +21,22 @@ if "!PYTHON!"=="" (
 )
 
 if "!PYTHON!"=="" (
-    echo Python not found. Install Python 3.10-3.13 from python.org
+    echo Python not found. Trying winget install...
+    winget install -e --id Python.Python.3.13 --silent --accept-package-agreements --accept-source-agreements
+    if errorlevel 1 (
+        echo winget failed. Install Python 3.10-3.13 manually from python.org
+        pause
+        exit /b 1
+    )
+    REM Re-search after winget install
+    if exist "%USERPROFILE%\AppData\Local\Programs\Python\Python313\python.exe" set "PYTHON=%USERPROFILE%\AppData\Local\Programs\Python\Python313\python.exe"
+    if "!PYTHON!"=="" if exist "%USERPROFILE%\AppData\Local\Programs\Python\Python312\python.exe" set "PYTHON=%USERPROFILE%\AppData\Local\Programs\Python\Python312\python.exe"
+    if "!PYTHON!"=="" if exist "%USERPROFILE%\AppData\Local\Programs\Python\Python311\python.exe" set "PYTHON=%USERPROFILE%\AppData\Local\Programs\Python\Python311\python.exe"
+    if "!PYTHON!"=="" if exist "%USERPROFILE%\AppData\Local\Programs\Python\Python310\python.exe" set "PYTHON=%USERPROFILE%\AppData\Local\Programs\Python\Python310\python.exe"
+)
+
+if "!PYTHON!"=="" (
+    echo Python still not found after install. Try rebooting or install manually from python.org
     pause
     exit /b 1
 )

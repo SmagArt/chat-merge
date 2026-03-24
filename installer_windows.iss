@@ -1,5 +1,5 @@
 #define AppName "Merge Chat"
-#define AppVersion "2.1.1"
+#define AppVersion "2.2"
 #define AppPublisher "Artem Smagin"
 #define AppURL "https://github.com/SmagArt/chat-merge"
 

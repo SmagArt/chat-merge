@@ -1019,17 +1019,18 @@ def merge_consecutive(messages: list) -> list:
 # ──────────────────────────────────────────────
 
 def format_output(messages: list, sources: list, contact: str,
-                  fmt: str = "txt") -> str:
+                  fmt: str = "txt", show_timestamps: bool = True) -> str:
     """
     fmt: 'txt' — текстовый формат (по умолчанию)
          'md'  — Markdown формат
+    show_timestamps: False — убирает метки времени из вывода
     """
     if fmt == "md":
-        return _format_markdown(messages, sources, contact)
-    return _format_txt(messages, sources, contact)
+        return _format_markdown(messages, sources, contact, show_timestamps)
+    return _format_txt(messages, sources, contact, show_timestamps)
 
 
-def _format_txt(messages: list, sources: list, contact: str) -> str:
+def _format_txt(messages: list, sources: list, contact: str, show_timestamps: bool = True) -> str:
     lines = [
         "=" * 56,
         f"Переписка: {contact}",
@@ -1066,14 +1067,15 @@ def _format_txt(messages: list, sources: list, contact: str) -> str:
             ts = "??:??:??"
 
         text_lines = msg["text"].split("\n")
-        lines.append(f"{ts} {msg['sender']}: {text_lines[0]}")
+        prefix = f"{ts} " if show_timestamps else ""
+        lines.append(f"{prefix}{msg['sender']}: {text_lines[0]}")
         for line in text_lines[1:]:
             lines.append(f"  {line}")
 
     return "\n".join(lines)
 
 
-def _format_markdown(messages: list, sources: list, contact: str) -> str:
+def _format_markdown(messages: list, sources: list, contact: str, show_timestamps: bool = True) -> str:
     lines = [
         f"# Переписка: {contact}",
         "",
@@ -1128,7 +1130,8 @@ def _format_markdown(messages: list, sources: list, contact: str) -> str:
             lines.append(f"> {line.strip()}")
         # Основная строка с меткой времени
         first = content_lines[0] if content_lines else ""
-        lines.append(f"`{ts}` {sender_md}: {first}")
+        ts_prefix = f"`{ts}` " if show_timestamps else ""
+        lines.append(f"{ts_prefix}{sender_md}: {first}")
         for line in content_lines[1:]:
             lines.append(f"  {line}")
         lines.append("")
@@ -1306,7 +1309,10 @@ def process_folder(folder_path: str,
                    log_cb=None,
                    progress_cb=None,
                    date_from: str = "",
-                   date_to: str = "") -> Optional[str]:
+                   date_to: str = "",
+                   show_timestamps: bool = True,
+                   split_mode: str = "none") -> Optional[str]:
+    """split_mode: 'none' | 'month' | 'year'"""
     """
     Высокоуровневая функция для GUI.
     Возвращает путь к итоговому файлу или None при ошибке.
@@ -1597,16 +1603,43 @@ def process_folder(folder_path: str,
             safe = "chat"
 
         ext = ".md" if output_format == "md" else ".txt"
-        # Save file IN the selected folder (next to voice_messages etc.)
-        output_dir = folder  # always save inside the top-level folder user picked
-        out_path = output_dir / f"{safe}{ext}"
+        output_dir = folder
+        out_path = None
 
-        result = format_output(all_messages, sources, contact, output_format)
-        out_path.write_text(result, encoding="utf-8")
-
-        if progress_cb: progress_cb(1.0)
-        kb = out_path.stat().st_size // 1024
-        if log_cb: log_cb(f"\n✓ Готово → {out_path} ({kb} КБ)")
+        if split_mode in ("month", "year"):
+            from itertools import groupby
+            if split_mode == "month":
+                def _key(m): return f"{m['dt'].year}-{m['dt'].month:02d}" if m.get("dt") else ""
+            else:
+                def _key(m): return str(m["dt"].year) if m.get("dt") else ""
+            with_dt    = [m for m in all_messages if m.get("dt")]
+            without_dt = [m for m in all_messages if not m.get("dt")]
+            files_written = 0
+            for label, group in groupby(with_dt, key=_key):
+                if not label:
+                    continue
+                chunk = list(group)
+                chunk_path = output_dir / f"{safe}_{label}{ext}"
+                result = format_output(chunk, sources, contact, output_format, show_timestamps)
+                chunk_path.write_text(result, encoding="utf-8")
+                kb = chunk_path.stat().st_size // 1024
+                if log_cb: log_cb(f"  → {chunk_path.name} ({len(chunk)} сообщ., {kb} КБ)")
+                files_written += 1
+                out_path = chunk_path
+            if without_dt:
+                nd_path = output_dir / f"{safe}_no_date{ext}"
+                result = format_output(without_dt, sources, contact, output_format, show_timestamps)
+                nd_path.write_text(result, encoding="utf-8")
+                files_written += 1
+            if progress_cb: progress_cb(1.0)
+            if log_cb: log_cb(f"\n✓ Готово → {output_dir} ({files_written} файлов)")
+        else:
+            out_path = output_dir / f"{safe}{ext}"
+            result = format_output(all_messages, sources, contact, output_format, show_timestamps)
+            out_path.write_text(result, encoding="utf-8")
+            if progress_cb: progress_cb(1.0)
+            kb = out_path.stat().st_size // 1024
+            if log_cb: log_cb(f"\n✓ Готово → {out_path} ({kb} КБ)")
 
         _elapsed=_time.time()-_start_time
         _m,_s=divmod(int(_elapsed),60)
