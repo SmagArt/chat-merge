@@ -84,6 +84,26 @@ SCRIPT = find_script()
 _cancel_event = threading.Event()
 
 
+def _whisper_ok():
+    try:
+        import whisper  # noqa
+        return True
+    except Exception:
+        return False
+
+
+def _has_nvidia():
+    if not IS_WIN:
+        return False
+    try:
+        out = subprocess.check_output(
+            ["wmic", "path", "win32_VideoController", "get", "name"],
+            creationflags=0x08000000, stderr=subprocess.DEVNULL, text=True)
+        return "nvidia" in out.lower()
+    except Exception:
+        return False
+
+
 class App(_BaseApp):
     def __init__(self):
         # Taskbar icon fix: Windows needs AppUserModelID set BEFORE window creation
@@ -128,6 +148,8 @@ class App(_BaseApp):
         self._recent     = self._cfg.get("recent", [])
 
         self._build()
+        if _whisper_ok():
+            self._whisper_banner.pack_forget()
 
         W, H = 820, 1040
         self.update_idletasks()
@@ -370,6 +392,17 @@ class App(_BaseApp):
             self._mbtns[m] = b
 
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
+
+        self._whisper_banner = ctk.CTkFrame(si, fg_color="#261A08", corner_radius=8,
+                                             border_color="#5A3A10", border_width=1)
+        ctk.CTkLabel(self._whisper_banner,
+                     text="⚠  Whisper не установлен — голосовые расшифровываться не будут",
+                     font=self._f(11), text_color="#E8944A").pack(side="left", padx=(10, 4), pady=7)
+        ctk.CTkButton(self._whisper_banner, text="Установить", width=100, height=26,
+                      font=self._f(11), fg_color="#D07030", hover_color="#B05020",
+                      text_color="white", corner_radius=6,
+                      command=self._show_install_dialog).pack(side="right", padx=(4, 10), pady=7)
+        self._whisper_banner.pack(fill="x", pady=(0, 8))
 
         r3 = ctk.CTkFrame(si, fg_color="transparent"); r3.pack(fill="x", pady=5)
         ctk.CTkLabel(r3, text="Объединять подряд идущие", font=self._f(13),
@@ -762,6 +795,109 @@ class App(_BaseApp):
         self.model_var.set(m)
         for k, b in self._mbtns.items():
             b.configure(fg_color=T("ACCENT") if k == m else T("SURFACE"))
+
+    def _show_install_dialog(self):
+        has_nv = _has_nvidia()
+        size_str = "~2.5 ГБ (NVIDIA CUDA)" if has_nv else "~300 МБ (CPU)"
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Установка Whisper")
+        dlg.resizable(False, False)
+        dlg.geometry("520x450")
+        dlg.grab_set()
+        dlg.focus_set()
+
+        ctk.CTkLabel(dlg, text="Поддержка расшифровки голосовых",
+                     font=self._f(15, "bold"), text_color=T("TEXT")).pack(pady=(20, 4), padx=20)
+        ctk.CTkLabel(dlg,
+                     text=f"Будет установлено: Whisper + PyTorch  ({size_str})\n"
+                          "Нужен интернет. После установки перезапуск не нужен.",
+                     font=self._f(11), text_color=T("SUB"), justify="center").pack(padx=20, pady=(0, 12))
+
+        pbar = ctk.CTkProgressBar(dlg, height=6, fg_color=T("SURFACE"),
+                                   progress_color=T("ACCENT"), corner_radius=2)
+        pbar.pack(fill="x", padx=20, pady=(4, 2))
+        pbar.set(0)
+        plbl = ctk.CTkLabel(dlg, text="", font=self._f(10), text_color=T("SUB"))
+        plbl.pack(anchor="w", padx=22)
+
+        log_box = ctk.CTkTextbox(dlg, font=self._mono(11), fg_color=T("SURFACE"),
+                                  text_color=T("TEXT"), height=190, corner_radius=8,
+                                  border_color=T("BORDER"), border_width=1)
+        log_box.pack(fill="x", padx=20, pady=(8, 8))
+        log_box.configure(state="disabled")
+
+        bf = ctk.CTkFrame(dlg, fg_color="transparent")
+        bf.pack(fill="x", padx=20, pady=(0, 16))
+
+        close_btn = ctk.CTkButton(bf, text="Закрыть", width=110, height=36,
+                                   font=self._f(12), fg_color=T("SURFACE"),
+                                   hover_color=T("BORDER"), text_color=T("SUB"),
+                                   corner_radius=8, state="disabled", command=dlg.destroy)
+        close_btn.pack(side="left")
+
+        install_btn = ctk.CTkButton(bf, text="Установить", width=140, height=36,
+                                     font=self._f(12, "bold"), fg_color=T("ACCENT"),
+                                     hover_color=T("ACCENT2"), corner_radius=8)
+        install_btn.pack(side="right")
+
+        def _append(line):
+            log_box.configure(state="normal")
+            log_box.insert("end", line + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+
+        def on_done(success):
+            pbar.stop()
+            pbar.configure(mode="determinate")
+            close_btn.configure(state="normal")
+            if success:
+                pbar.set(1.0)
+                plbl.configure(text="Готово! Голосовые будут расшифровываться при следующем запуске.")
+                install_btn.configure(text="✓ Установлено", fg_color=T("GREEN"), state="disabled")
+                self._whisper_banner.pack_forget()
+            else:
+                pbar.set(0)
+                plbl.configure(text="Ошибка. Проверьте лог выше.")
+                install_btn.configure(text="Повторить", state="normal", fg_color="#AA3333",
+                                       command=do_install)
+
+        def do_install():
+            install_btn.configure(state="disabled", text="Установка...")
+            pbar.configure(mode="indeterminate")
+            pbar.start()
+
+            def run():
+                kw = {"creationflags": 0x08000000} if IS_WIN else {}
+
+                def run_pip(args, label):
+                    dlg.after(0, plbl.configure, {"text": label})
+                    proc = subprocess.Popen(
+                        [sys.executable, "-m", "pip", "install"] + args,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, **kw)
+                    for line in proc.stdout:
+                        line = line.rstrip()
+                        if line:
+                            dlg.after(0, _append, line)
+                            if len(line) < 80:
+                                dlg.after(0, plbl.configure, {"text": line})
+                    proc.wait()
+                    return proc.returncode
+
+                r1 = run_pip(["openai-whisper"], "Скачивание Whisper...")
+                if has_nv:
+                    r2 = run_pip(["torch", "--index-url",
+                                  "https://download.pytorch.org/whl/cu124"],
+                                 "Скачивание PyTorch CUDA (~2.5 ГБ)...")
+                else:
+                    r2 = run_pip(["torch"], "Скачивание PyTorch CPU (~300 МБ)...")
+
+                dlg.after(0, on_done, r1 == 0 and r2 == 0)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        install_btn.configure(command=do_install)
 
     def _toggle_merge(self):
         self.merge_on = not self.merge_on
