@@ -1,5 +1,5 @@
 #define AppName "Merge Chat"
-#define AppVersion "2.1.1"
+#define AppVersion "2.4"
 #define AppPublisher "Artem Smagin"
 #define AppURL "https://github.com/SmagArt/chat-merge"
 
@@ -10,18 +10,17 @@ AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppURL}
-DefaultDirName={localappdata}\Programs\{#AppName}
+DefaultDirName={localappdata}\Programs\MergeChat
 DefaultGroupName={#AppName}
 AllowNoIcons=yes
 SetupIconFile=merge_chat.ico
 UninstallDisplayIcon={app}\merge_chat.ico
 OutputDir=dist_installer
-OutputBaseFilename=MergeChat_Setup_v{#AppVersion}
+OutputBaseFilename=MergeChat_Setup_v{#AppVersion}_admin
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequired=admin
 MinVersion=10.0
 DisableProgramGroupPage=yes
 
@@ -32,15 +31,16 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Дополнительно:"
 
 [Files]
-; Full Python installer (download via prepare_installer.bat before building)
+; Full Python installer — installs to {app}\python (requires admin + Python not already installed)
 Source: "python-installer\python-3.13.2-amd64.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
-; App files
+
 Source: "merge_chat.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "merge_chat_gui.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "merge_chat.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "merge_chat_1024.png"; DestDir: "{app}"; Flags: ignoreversion
 Source: "requirements.txt"; DestDir: "{app}"; Flags: ignoreversion
-Source: "setup_python.bat"; DestDir: "{app}"; Flags: ignoreversion
+Source: "setup_base.bat"; DestDir: "{app}"; Flags: ignoreversion
+Source: "setup_whisper.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "launcher_win.vbs"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -48,13 +48,16 @@ Name: "{group}\{#AppName}"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\
 Name: "{autodesktop}\{#AppName}"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\launcher_win.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\merge_chat.ico"; Tasks: desktopicon
 
 [Run]
-; Step 1: Install Python silently (full installer, includes tkinter)
-Filename: "{tmp}\python-3.13.2-amd64.exe"; Parameters: "/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 TargetDir={app}\python"; StatusMsg: "Установка Python..."; Flags: waituntilterminated
+; Step 1: Install Python 3.13 to {app}\python
+Filename: "{tmp}\python-3.13.2-amd64.exe"; Parameters: "/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_test=0 Include_doc=0 SimpleInstall=1 TargetDir=""{app}\python"""; StatusMsg: "Установка Python 3.13..."; Flags: waituntilterminated
 
-; Step 2: Install packages (GUI progress via setup_python.bat)
-Filename: "{app}\setup_python.bat"; WorkingDir: "{app}"; StatusMsg: "Установка пакетов..."; Flags: waituntilterminated runhidden
+; Step 2: Base packages (~50 MB)
+Filename: "{app}\setup_base.bat"; WorkingDir: "{app}"; StatusMsg: "Установка базовых пакетов..."; Flags: waituntilterminated runhidden
 
-; Step 3: Optional launch
+; Step 3: Create pkgs_ok flag — launcher стартует сразу без проверок
+Filename: "cmd.exe"; Parameters: "/c echo done > ""{app}\pkgs_ok.flag"""; Flags: runhidden waituntilterminated
+
+; Step 4: Optional launch
 Filename: "{sys}\wscript.exe"; Parameters: """{app}\launcher_win.vbs"""; WorkingDir: "{app}"; Description: "Запустить {#AppName}"; Flags: nowait postinstall skipifsilent unchecked
 
 [UninstallDelete]

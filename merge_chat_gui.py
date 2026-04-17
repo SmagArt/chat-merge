@@ -1,4 +1,4 @@
-"""Merge Chat — GUI v2.1"""
+"""Merge Chat — GUI v2.3"""
 import sys, os, threading, subprocess, re, platform, multiprocessing, json
 from pathlib import Path
 
@@ -19,6 +19,12 @@ try:
 except ImportError:
     _HAS_DND = False
     DND_FILES = None
+
+try:
+    import whisper as _wchk; del _wchk
+    _WHISPER_OK = True
+except ImportError:
+    _WHISPER_OK = False
 
 # ВСЕГДА ctk.CTk - DnD инжектируется через _require() после создания окна
 _BaseApp = ctk.CTk
@@ -46,7 +52,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.1.1"
+VERSION = "2.4"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -117,6 +123,9 @@ class App(_BaseApp):
         self.model_var   = ctk.StringVar(value=self._cfg.get("model", "small"))
         self.merge_on    = self._cfg.get("merge_on", False)
         self.fmt_md      = self._cfg.get("fmt_md", False)
+        self.show_ts     = self._cfg.get("show_ts", True)
+        # split_mode: "none" / "month" / "year"
+        self.split_mode  = self._cfg.get("split_mode", "none")
         self.date_from       = ctk.StringVar(value="")   # не сохраняем — всегда пустой при старте
         self.date_to         = ctk.StringVar(value="")
         self.running     = False
@@ -126,20 +135,34 @@ class App(_BaseApp):
 
         self._build()
 
-        W, H = 820, 1040
+        W = 820
+        H_target = 1040 if _WHISPER_OK else 1100
         self.update_idletasks()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        # Adaptive height: leave 80px for taskbar + margins
+        sh_avail = sh - 80
+        H = min(H_target, sh_avail)
+        if H < H_target:
+            # Shrink log box by the overflow amount
+            shrink = H_target - H
+            try:
+                new_log_h = max(60, self.log.cget("height") - shrink)
+                self.log.configure(height=new_log_h)
+            except Exception:
+                pass
         self.configure(fg_color=T("BG"))
-        self.geometry(f"{W}x{H}+{(sw-W)//2}+{max(20,(sh-H)//2-20)}")
+        self.geometry(f"{W}x{H}+{(sw-W)//2}+{max(0,(sh-H)//2-30)}")
 
         # Иконка — только Windows (.ico). На Mac без .app bundle иконку не задать
         if IS_WIN:
             _ico = self._find_icon()
             if _ico:
+                # Ставим дважды: сразу + после полной инициализации окна
                 try:
-                    self.iconbitmap(str(_ico))
+                    self.iconbitmap(default=str(_ico))
                 except Exception:
                     pass
+                self.after(300, lambda p=_ico: self._set_win_taskbar_icon(p))
 
         if _HAS_DND:
             try:
@@ -169,6 +192,35 @@ class App(_BaseApp):
                 return p
         return None
 
+    def _set_win_taskbar_icon(self, ico_path):
+        """Ставим иконку в taskbar через ctypes — iconbitmap не всегда работает."""
+        try:
+            import ctypes
+            LR_LOADFROMFILE  = 0x0010
+            LR_DEFAULTSIZE   = 0x0040
+            IMAGE_ICON       = 1
+            WM_SETICON       = 0x0080
+            ICON_SMALL       = 0
+            ICON_BIG         = 1
+            path = str(ico_path)
+            # FindWindowW надёжнее GetParent для CustomTkinter
+            hwnd = ctypes.windll.user32.FindWindowW(None, self.title())
+            if not hwnd:
+                hwnd = self.winfo_id()
+            hicon_big   = ctypes.windll.user32.LoadImageW(
+                None, path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+            hicon_small = ctypes.windll.user32.LoadImageW(
+                None, path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG,   hicon_big)
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+            # Также iconbitmap ещё раз — для надёжности
+            try:
+                self.iconbitmap(default=path)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _f(self, size=13, w="normal"):
         return ctk.CTkFont("Segoe UI" if IS_WIN else "SF Pro Display", size, w)
 
@@ -187,7 +239,9 @@ class App(_BaseApp):
                 "author":   self.author_var.get(),
                 "model":    self.model_var.get(),
                 "theme":    _theme,
-                "fmt_md":   self.fmt_md,
+                "fmt_md":    self.fmt_md,
+                "show_ts":   self.show_ts,
+                "split_mode": self.split_mode,
                 "merge_on": self.merge_on,
                 "recent":   self._recent,
                 # dates not saved — always empty on start
@@ -233,6 +287,24 @@ class App(_BaseApp):
         else:
             self._fmt_btn.configure(text="📄 TXT", fg_color=T("MUTED"), text_color=T("SUB"))
 
+    def _toggle_split(self):
+        cycle = {"none": "month", "month": "year", "year": "none"}
+        self.split_mode = cycle[self.split_mode]
+        labels = {"none":  ("📄 один файл",  T("SURFACE"), T("BORDER"), T("SUB")),
+                  "month": ("📅 по месяцам", T("ACCENT"),  T("ACCENT"), "white"),
+                  "year":  ("📆 по годам",   T("GREEN"),   T("GREEN"),  "white")}
+        txt, fg, bc, tc = labels[self.split_mode]
+        self._split_btn.configure(text=txt, fg_color=fg, border_color=bc, text_color=tc)
+
+    def _toggle_ts(self):
+        self.show_ts = not self.show_ts
+        if self.show_ts:
+            self._ts_btn.configure(text="🕐 ВКЛ", fg_color=T("SURFACE"),
+                                   border_color=T("BORDER"), text_color=T("SUB"))
+        else:
+            self._ts_btn.configure(text="🕐 ВЫКЛ", fg_color=T("ACCENT"),
+                                   border_color=T("ACCENT"), text_color="white")
+
     def _build(self):
         P = 28
 
@@ -256,7 +328,7 @@ class App(_BaseApp):
         left.pack(side="left")
         ctk.CTkLabel(left, text="Merge Chat",
                      font=self._f(28, "bold"), text_color=T("TEXT")).pack(side="left")
-        ctk.CTkLabel(left, text="  Telegram & ВКонтакте → TXT/MD",
+        ctk.CTkLabel(left, text="  TG · VK · Instagram · WhatsApp → TXT/MD",
                      font=self._f(12), text_color=T("SUB")).pack(side="left", pady=(10, 0))
 
         right_hdr = ctk.CTkFrame(hdr, fg_color="transparent")
@@ -346,6 +418,25 @@ class App(_BaseApp):
             b.pack(side="left", padx=3)
             self._mbtns[m] = b
 
+        # Баннер "Whisper не установлен" — показывается если whisper недоступен
+        if not _WHISPER_OK:
+            self._whisper_banner = ctk.CTkFrame(
+                si, fg_color="#2A1A00", corner_radius=8,
+                border_color="#D97706", border_width=1)
+            self._whisper_banner.pack(fill="x", pady=(8, 0))
+            _wb = ctk.CTkFrame(self._whisper_banner, fg_color="transparent")
+            _wb.pack(fill="x", padx=12, pady=8)
+            ctk.CTkLabel(_wb, text="Whisper не установлен — голосовые не будут расшифрованы",
+                         font=self._f(12), text_color="#FCD34D", anchor="w").pack(side="left", fill="x", expand=True)
+            self._install_btn = ctk.CTkButton(
+                _wb, text="Установить", width=140, height=30,
+                font=self._f(12, "bold"), fg_color="#D97706",
+                hover_color="#B45309", text_color="white",
+                corner_radius=7, command=self._install_whisper)
+            self._install_btn.pack(side="right", padx=(8, 0))
+        else:
+            self._whisper_banner = None
+
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
 
         r3 = ctk.CTkFrame(si, fg_color="transparent"); r3.pack(fill="x", pady=5)
@@ -365,7 +456,7 @@ class App(_BaseApp):
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
 
         r4 = ctk.CTkFrame(si, fg_color="transparent"); r4.pack(fill="x", pady=5)
-        ctk.CTkLabel(r4, text="Формат вывода", font=self._f(13),
+        ctk.CTkLabel(r4, text="Формат · Метки времени", font=self._f(13),
                      text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
         fmt_text = "📝 MD" if self.fmt_md else "📄 TXT"
         fmt_fg   = T("ACCENT") if self.fmt_md else T("MUTED")
@@ -375,7 +466,16 @@ class App(_BaseApp):
             fg_color=fmt_fg, hover_color=T("ACCENT2"),
             text_color=fmt_tc, corner_radius=7, command=self._toggle_fmt)
         self._fmt_btn.pack(side="left")
-        ctk.CTkLabel(r4, text="  TXT — простой текст · MD — Markdown (Obsidian, Notion)",
+        _ts_fg  = T("SURFACE") if self.show_ts else T("ACCENT")
+        _ts_bc  = T("BORDER")  if self.show_ts else T("ACCENT")
+        _ts_tc  = T("SUB")     if self.show_ts else "white"
+        _ts_txt = "🕐 ВКЛ"    if self.show_ts else "🕐 ВЫКЛ"
+        self._ts_btn = ctk.CTkButton(
+            r4, text=_ts_txt, width=90, height=30, font=self._f(12, "bold"),
+            fg_color=_ts_fg, hover_color=T("ACCENT2"), border_color=_ts_bc, border_width=1,
+            text_color=_ts_tc, corner_radius=7, command=self._toggle_ts)
+        self._ts_btn.pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(r4, text="  TXT/MD · время сообщений вкл/выкл",
                      font=self._f(10), text_color=T("SUB")).pack(side="left", padx=(8, 0))
 
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
@@ -395,8 +495,17 @@ class App(_BaseApp):
                       fg_color=T("MUTED"), hover_color=T("BORDER"),
                       text_color=T("SUB"), corner_radius=7,
                       command=self._clear_dates).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(df, text="пусто = вся переписка",
-                     font=self._f(10), text_color=T("SUB")).pack(side="left")
+        _split_labels = {
+            "none":  ("📄 один файл",  T("SURFACE"), T("BORDER"), T("SUB")),
+            "month": ("📅 по месяцам", T("ACCENT"),  T("ACCENT"), "white"),
+            "year":  ("📆 по годам",   T("GREEN"),   T("GREEN"),  "white"),
+        }
+        _sp_txt, _sp_fg, _sp_bc, _sp_tc = _split_labels[self.split_mode]
+        self._split_btn = ctk.CTkButton(
+            df, text=_sp_txt, width=120, height=30, font=self._f(11, "bold"),
+            fg_color=_sp_fg, hover_color=T("ACCENT2"), border_color=_sp_bc, border_width=1,
+            text_color=_sp_tc, corner_radius=7, command=self._toggle_split)
+        self._split_btn.pack(side="left", padx=(8, 0))
 
         self._gap(16)
 
@@ -450,6 +559,132 @@ class App(_BaseApp):
 
     def _gap(self, h=12):
         ctk.CTkFrame(self, fg_color="transparent", height=h).pack()
+
+    def _install_whisper(self):
+        bat = Path(__file__).parent / "setup_whisper.bat"
+        if not bat.exists():
+            self._log("setup_whisper.bat не найден рядом с программой")
+            return
+        self._install_btn.configure(state="disabled", text="Устанавливаю...")
+        self._log("--- Установка Whisper и PyTorch ---")
+        self._log("Идёт скачивание пакетов. При наличии NVIDIA — до 2.5 ГБ.")
+        self.pbar.configure(mode="determinate")
+        self.pbar.set(0.02)
+        self.plbl.configure(text="Запускаю...")
+
+        log_file = Path(__file__).parent / "install_log.txt"
+
+        # Phase markers written by setup_whisper.bat → (progress 0..1, status label)
+        _PHASES = {
+            "[PHASE:CHECKING]":            (0.05, "Проверяю окружение..."),
+            "[PHASE:DOWNLOAD_WHISPER]":    (0.10, "Скачиваю Whisper (~50 МБ)..."),
+            "[PHASE:DOWNLOAD_TORCH_CUDA]": (0.30, "Скачиваю PyTorch CUDA (~2.5 ГБ)..."),
+            "[PHASE:DOWNLOAD_TORCH_CPU]":  (0.30, "Скачиваю PyTorch CPU (~300 МБ)..."),
+            "[PHASE:DONE]":                (0.96, "Завершаю..."),
+        }
+
+        def _worker():
+            import time
+            _cur      = [0.02]
+            _phase    = [""]
+            _ts_start = [time.time()]
+
+            def _set(pct, label=None):
+                if pct > _cur[0]:
+                    _cur[0] = pct
+                    self.after(0, self.pbar.set, pct)
+                if label:
+                    _phase[0] = label
+                    elapsed = int(time.time() - _ts_start[0])
+                    m, s = divmod(elapsed, 60)
+                    suffix = f"  {m}:{s:02d}" if elapsed >= 5 else ""
+                    self.after(0, self.plbl.configure, {"text": label + suffix})
+
+            def _tick_elapsed():
+                if _phase[0]:
+                    elapsed = int(time.time() - _ts_start[0])
+                    m, s = divmod(elapsed, 60)
+                    self.after(0, self.plbl.configure,
+                               {"text": _phase[0] + f"  {m}:{s:02d}"})
+
+            try:
+                kw = {"creationflags": 0x08000000} if IS_WIN else {}
+                proc = subprocess.Popen(["cmd.exe", "/c", str(bat)], **kw)
+                last_pos = log_file.stat().st_size if log_file.exists() else 0
+                _tick = 0
+
+                while proc.poll() is None:
+                    time.sleep(0.5)
+                    _tick += 1
+
+                    # Slow creep during long torch download (max 0.88)
+                    if _cur[0] >= 0.29:
+                        elapsed = time.time() - _ts_start[0]
+                        creep = 0.30 + min(0.57, elapsed / 600 * 0.57)
+                        if creep > _cur[0]:
+                            _cur[0] = creep
+                            self.after(0, self.pbar.set, creep)
+
+                    # Update elapsed timer every 2 seconds
+                    if _tick % 4 == 0:
+                        _tick_elapsed()
+
+                    if not log_file.exists():
+                        continue
+                    size = log_file.stat().st_size
+                    if size <= last_pos:
+                        continue
+                    try:
+                        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                            f.seek(last_pos)
+                            chunk = f.read()
+                        last_pos = size
+                        for raw in chunk.splitlines():
+                            line = raw.strip()
+                            if not line:
+                                continue
+                            # Phase marker
+                            if line in _PHASES:
+                                pct, label = _PHASES[line]
+                                _set(pct, label)
+                                continue
+                            # Skip garbled pip progress lines (ANSI / box chars)
+                            if any(c in line for c in ('\x1b', '\r', '━', '─', '|')):
+                                continue
+                            self.after(0, lambda l=line: self._log(l))
+                    except Exception:
+                        pass
+
+                rc = proc.returncode
+                self.after(0, self.pbar.set, 1.0 if rc == 0 else _cur[0])
+                self.after(0, self.plbl.configure, {"text": ""})
+
+                if rc == 0:
+                    try:
+                        import whisper  # noqa
+                        self.after(0, self._on_whisper_installed)
+                    except ImportError:
+                        self.after(0, lambda: self._log("Установлено. Перезапустите программу."))
+                        self.after(0, lambda: self._install_btn.configure(
+                            state="normal", text="Перезапустить"))
+                else:
+                    self.after(0, lambda: self._log(
+                        f"Ошибка установки (код {rc}). Подробности: install_log.txt"))
+                    self.after(0, lambda: self._install_btn.configure(
+                        state="normal", text="Попробовать снова"))
+
+            except Exception as e:
+                self.after(0, lambda: self._log(f"Ошибка: {e}"))
+                self.after(0, lambda: self._install_btn.configure(
+                    state="normal", text="Попробовать снова"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_whisper_installed(self):
+        self._log("--- Whisper успешно установлен ---")
+        if self._whisper_banner:
+            self._whisper_banner.destroy()
+            self._whisper_banner = None
 
     def _section(self, txt):
         ctk.CTkLabel(self, text=txt, font=self._f(11, "bold"),
@@ -727,6 +962,9 @@ class App(_BaseApp):
         if self.merge_on:
             self.mbtn.configure(text="● ВКЛ", fg_color=T("GREEN"), hover_color=T("GREEN2"),
                                  text_color=T("TEXT"))
+            self.plbl.configure(text="⚠ Объединение — только для диалогов, не для групп!",
+                                 text_color="#f59e0b")
+            self.after(4000, lambda: self.plbl.configure(text="", text_color=T("SUB")))
         else:
             self.mbtn.configure(text="○ ВЫКЛ", fg_color=T("MUTED"), hover_color=T("BORDER"),
                                  text_color=T("SUB"))
@@ -761,8 +999,8 @@ class App(_BaseApp):
         ctk.CTkLabel(win, text=GITHUB, font=self._f(11),
                      text_color=T("ACCENT")).pack(pady=(2, 0))
         ctk.CTkFrame(win, fg_color=T("BORDER"), height=1).pack(fill="x", padx=40, pady=16)
-        ctk.CTkLabel(win, text="Объединяет переписки Telegram и ВКонтакте\n"
-                               "в один файл.\n"
+        ctk.CTkLabel(win, text="Объединяет переписки Telegram, ВКонтакте,\n"
+                               "Instagram и WhatsApp в один файл.\n"
                                "Расшифровывает голосовые через Whisper\n"
                                "офлайн, без облаков.",
                      font=self._f(12), text_color=T("SUB"), justify="center").pack(padx=36)
@@ -895,6 +1133,8 @@ class App(_BaseApp):
                     progress_cb=lambda p: self.after(0, self.pbar.set, min(float(p), 1.0)),
                     date_from=self.date_from.get().strip(),
                     date_to=self.date_to.get().strip(),
+                    show_timestamps=self.show_ts,
+                    split_mode=self.split_mode,
                 )
                 cancelled = _cancel_event.is_set()
                 self.after(0, self._done, bool(out), cancelled)

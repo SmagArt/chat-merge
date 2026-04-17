@@ -27,19 +27,23 @@ echo %DATE% %TIME% base packages >> "%LOGFILE%"
 echo %DATE% %TIME% base exit=%ERRORLEVEL% >> "%LOGFILE%"
 
 REM NVIDIA detection — install CUDA torch if found
-REM cu124 required for Python 3.13 (cu121 only supports up to 3.12)
-wmic path win32_VideoController get name 2>nul | findstr /i "nvidia" >nul 2>&1
-if %ERRORLEVEL%==0 (
-    echo %DATE% %TIME% NVIDIA found - installing torch CUDA 12.4 >> "%LOGFILE%"
-    "%PY%" -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall -q >> "%LOGFILE%" 2>&1
+powershell -NoProfile -Command "(Get-WmiObject Win32_VideoController).Name" 2>nul | findstr /i "nvidia" >nul
+if !ERRORLEVEL!==0 (
+    "%PY%" -c "import torch; exit(0 if torch.cuda.is_available() else 1)" >nul 2>&1
+    if !ERRORLEVEL!==0 (
+        echo %DATE% %TIME% torch CUDA already OK, skip >> "%LOGFILE%"
+        goto :done_torch
+    )
+    echo %DATE% %TIME% NVIDIA found - installing torch CUDA 12.8 (~2.5 GB... >> "%LOGFILE%"
+    "%PY%" -m pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall >> "%LOGFILE%" 2>&1
     echo %DATE% %TIME% torch CUDA exit=%ERRORLEVEL% >> "%LOGFILE%"
-    REM Verify CUDA actually works
     "%PY%" -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.__version__)" >> "%LOGFILE%" 2>&1
 ) else (
     echo %DATE% %TIME% No NVIDIA - CPU torch >> "%LOGFILE%"
-    "%PY%" -m pip install torch -q >> "%LOGFILE%" 2>&1
+    "%PY%" -m pip install torch >> "%LOGFILE%" 2>&1
     echo %DATE% %TIME% torch CPU exit=%ERRORLEVEL% >> "%LOGFILE%"
 )
+:done_torch
 
 echo %DATE% %TIME% DONE >> "%LOGFILE%"
 exit /b 0

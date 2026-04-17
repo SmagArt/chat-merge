@@ -9,5 +9,7 @@ merge_chat.iconset/
 build/
 dist/
 dist_mac/
+dist_installer/
+python-installer/
 *.spec
 build_log.txt

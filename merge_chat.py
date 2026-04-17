@@ -1,7 +1,7 @@
 """
 merge_chat.py — Универсальный объединитель переписок
 =====================================================
-Поддерживает: Telegram JSON, Telegram HTML, ВКонтакте HTML
+Поддерживает: Telegram JSON, Telegram HTML, ВКонтакте HTML, Instagram JSON
 Умеет: голосовые, кружочки (Whisper), стикеры, фото, ответы, пересылки
 
 Использование:
@@ -213,9 +213,10 @@ def normalize_author(name: str) -> str:
 # ──────────────────────────────────────────────
 
 def _progress_bar(done: int, total: int, w: int = 25) -> str:
-    pct  = done / total if total else 0
-    fill = int(w * pct)
-    return f"[{'█'*fill}{'░'*(w-fill)}] {done}/{total} ({pct*100:.0f}%)"
+    real_total = max(done, total) if total else done or 1
+    pct  = done / real_total
+    fill = min(int(w * pct), w)
+    return f"[{'█'*fill}{'░'*(w-fill)}] {done}/{real_total} ({pct*100:.0f}%)"
 
 
 def transcribe(file_path: Path) -> Optional[str]:
@@ -246,6 +247,7 @@ def transcribe(file_path: Path) -> Optional[str]:
                 print(f"  [ERR] torch architecture mismatch!")
                 print(f"  [ERR] Fix: run install_mac.command again — it will reinstall torch for your CPU")
             _log_error(f"whisper import error: {_imp_err}")
+            CFG.use_whisper = False  # не пытаться для остальных файлов
             return None
     whisper = _wmod
 
@@ -933,6 +935,9 @@ def find_all_chat_folders(root: Path) -> List[Path]:
         if re.match(r"messages\d*\.html", p.name, re.I):
             found.add(p.parent)
 
+    for p in root.rglob("_chat.txt"):
+        found.add(p.parent)
+
     def _folder_sort_key(p):
         n = p.name
         if n in (".", "..") or n.startswith("."):
@@ -941,23 +946,294 @@ def find_all_chat_folders(root: Path) -> List[Path]:
     return sorted(found, key=_folder_sort_key)
 
 
+# ──────────────────────────────────────────────
+#  Парсинг Instagram JSON
+# ──────────────────────────────────────────────
+
+def _fix_instagram_encoding(s: str) -> str:
+    """Instagram exports UTF-8 text stored as latin-1 bytes."""
+    if not isinstance(s, str):
+        return s
+    try:
+        return s.encode("latin-1").decode("utf-8")
+    except Exception:
+        return s
+
+
+def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
+    """
+    Загружает Instagram JSON-экспорт (message_1.json, message_2.json, ...).
+    Аудиофайлы ищет в папке audio/ рядом с JSON.
+    """
+    from datetime import timezone as _tz
+    json_files = sorted(
+        folder.glob("message_*.json"),
+        key=lambda p: int(re.search(r"\d+", p.stem).group() or 0)
+    )
+    if not json_files:
+        return [], ""
+
+    all_msgs: List[dict] = []
+    contact = ""
+
+    for jf in json_files:
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        # Имя контакта — из participants, не «я»
+        if not contact:
+            for p in data.get("participants", []):
+                name = _fix_instagram_encoding(p.get("name", ""))
+                norm = unicodedata.normalize("NFC", name).lower()
+                if norm not in CFG.my_names_lower:
+                    contact = name
+                    break
+
+        for m in data.get("messages", []):
+            try:
+                ts = datetime.fromtimestamp(
+                    m["timestamp_ms"] / 1000, tz=_tz.utc
+                ).astimezone().replace(tzinfo=None)
+            except Exception:
+                continue
+
+            sender_raw = m.get("sender_name", "")
+            sender = normalize_author(_fix_instagram_encoding(sender_raw))
+
+            voice_path = None
+            content = m.get("content", "")
+            if content:
+                content = _fix_instagram_encoding(content)
+            elif "audio_files" in m:
+                uri = m["audio_files"][0].get("uri", "") if m["audio_files"] else ""
+                fname = Path(uri).name
+                candidate = folder / "audio" / fname
+                if candidate.exists():
+                    content = "[🎤 Голосовое — нет расшифровки]"
+                    voice_path = str(candidate)
+                else:
+                    content = "[🎤 Голосовое — файл не найден]"
+            elif "photos" in m:
+                content = "[📷 Фото]"
+            elif "videos" in m:
+                content = "[🎬 Видео]"
+            elif "share" in m:
+                link = _fix_instagram_encoding(m["share"].get("link", ""))
+                content = f"[🔗 Репост: {link}]" if link else "[🔗 Репост]"
+            else:
+                content = "[Медиа]"
+
+            if not content:
+                continue
+
+            msg: dict = {
+                "id":     f"ig_{m['timestamp_ms']}_{sender_raw[:8]}",
+                "dt":     ts,
+                "sender": sender,
+                "text":   content,
+            }
+            if voice_path:
+                msg["_voice_path"] = voice_path
+            all_msgs.append(msg)
+
+    all_msgs.sort(key=lambda x: x["dt"])
+    print(f"  Instagram: сообщений — {len(all_msgs)}")
+    return all_msgs, contact
+
+
+# ──────────────────────────────────────────────
+#  Парсинг WhatsApp TXT
+# ──────────────────────────────────────────────
+
+def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
+    """
+    Загружает экспорт WhatsApp (_chat.txt).
+    Форматы: iOS [DD.MM.YYYY, HH:MM:SS] и Android DD.MM.YYYY, HH:MM:SS -
+    Голосовые: PTT-*.opus рядом с _chat.txt.
+    """
+    chat_file = folder / "_chat.txt"
+    if not chat_file.exists():
+        return [], ""
+
+    _MARKS = "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+
+    _PAT_IOS = re.compile(
+        r'^\[(\d{2})\.(\d{2})\.(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\]\s+(.+?): (.*)$'
+    )
+    _PAT_ANDROID = re.compile(
+        r'^(\d{2})\.(\d{2})\.(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\s+-\s+(.+?): (.*)$'
+    )
+    _PAT_HDR_IOS = re.compile(r'^\[(\d{2})\.(\d{2})\.(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\]')
+    _PAT_HDR_AND = re.compile(r'^(\d{2})\.(\d{2})\.(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\s+-')
+
+    def _strip(s):
+        for c in _MARKS:
+            s = s.replace(c, "")
+        return s
+
+    try:
+        raw = chat_file.read_bytes()
+        if raw.startswith(b'\xef\xbb\xbf'):
+            raw = raw[3:]
+        content = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return [], ""
+
+    # Group into (dt, sender_raw, text) chunks handling multiline messages
+    chunks = []
+    cur_dt = None
+    cur_sender = None
+    cur_lines: list = []
+
+    for line in content.splitlines():
+        clean = _strip(line.strip())
+        m = _PAT_IOS.match(clean) or _PAT_ANDROID.match(clean)
+        if m:
+            if cur_sender is not None:
+                chunks.append((cur_dt, cur_sender, "\n".join(cur_lines)))
+            d, mo, y, h, mi, sec, sender_raw, text = m.groups()
+            try:
+                cur_dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec))
+            except Exception:
+                cur_dt = None
+            cur_sender = sender_raw.strip()
+            cur_lines = [text.strip()]
+        elif _PAT_HDR_IOS.match(clean) or _PAT_HDR_AND.match(clean):
+            # System message — flush and skip
+            if cur_sender is not None:
+                chunks.append((cur_dt, cur_sender, "\n".join(cur_lines)))
+            cur_sender = None
+            cur_lines = []
+        elif cur_sender is not None:
+            cur_lines.append(line.rstrip())
+
+    if cur_sender is not None:
+        chunks.append((cur_dt, cur_sender, "\n".join(cur_lines)))
+
+    messages = []
+    contact = ""
+
+    for dt, sender_raw, raw_text in chunks:
+        text = _strip(raw_text.strip())
+        if not text:
+            continue
+
+        sender = normalize_author(sender_raw)
+        voice_path = None
+
+        # Strip "edited" marker
+        text = re.sub(r'\s*‎?<Сообщение изменено>$', '', text).strip()
+        text = re.sub(r'\s*<Message edited>$', '', text, flags=re.IGNORECASE).strip()
+
+        # Call log entries — label them
+        if re.search(r'Аудиозвонок|Видеозвонок|Voice call|Video call', text, re.IGNORECASE):
+            answered = not re.search(r'Нет ответа|No answer|Missed', text, re.IGNORECASE)
+            kind = "Видеозвонок" if re.search(r'Видеозвонок|Video call', text, re.IGNORECASE) else "Аудиозвонок"
+            text = f"[📞 {kind}{'✓' if answered else ': нет ответа'}]"
+
+        # Voice message (any *.opus — iOS: AUDIO-*.opus, Android: PTT-*.opus)
+        vm = re.search(
+            r'<(?:прикреплено|attached):\s*(\S+\.opus)\s*>',
+            text, re.IGNORECASE
+        )
+        if vm:
+            opus_path = folder / vm.group(1)
+            if opus_path.exists():
+                voice_path = str(opus_path)
+                t = transcribe(opus_path)
+                text = f"[🎤 Голосовое: {t}]" if t else "[🎤 Голосовое — нет расшифровки]"
+            else:
+                text = "[🎤 Голосовое — файл не найден]"
+        # Photo
+        elif re.search(
+            r'<(?:прикреплено|attached):\s*\S+\.(?:jpe?g|png|webp|heic)\s*>',
+            text, re.IGNORECASE
+        ):
+            # keep original caption if any (text before <прикреплено:>)
+            caption = re.sub(r'\s*<(?:прикреплено|attached):\s*\S+\s*>', '', text, flags=re.IGNORECASE).strip()
+            text = f"[📷 Фото{': ' + caption if caption else ''}]"
+        # Video
+        elif re.search(
+            r'<(?:прикреплено|attached):\s*\S+\.(?:mp4|mov|avi)\s*>',
+            text, re.IGNORECASE
+        ):
+            caption = re.sub(r'\s*<(?:прикреплено|attached):\s*\S+\s*>', '', text, flags=re.IGNORECASE).strip()
+            text = f"[🎬 Видео{': ' + caption if caption else ''}]"
+        # Generic attachment (contacts .vcf, documents, etc.)
+        elif re.search(r'<(?:прикреплено|attached):\s*(\S+)\s*>', text, re.IGNORECASE):
+            am = re.search(r'<(?:прикреплено|attached):\s*(\S+)\s*>', text, re.IGNORECASE)
+            text = f"[📎 {am.group(1)}]"
+        # Omitted media — "without files" export (iOS: "отсутствует", EN: "omitted")
+        elif re.search(
+            r'(?:изображение|аудиофайл|видео|документ|стикер|gif|'
+            r'image|audio|video|document|sticker)\s+'
+            r'(?:отсутствует|пропущен\w*|omitted)',
+            text, re.IGNORECASE
+        ):
+            if re.search(r'аудиофайл|audio', text, re.IGNORECASE):
+                text = "[🎤 Голосовое — файл не включён в экспорт]"
+            elif re.search(r'видео|video', text, re.IGNORECASE):
+                text = "[🎬 Видео]"
+            else:
+                text = "[Медиафайл]"
+
+        if sender != CFG.my_name and not contact:
+            contact = sender
+
+        msg: dict = {
+            "id":     None,
+            "dt":     dt,
+            "sender": sender,
+            "text":   text,
+            "source": "wa",
+        }
+        if voice_path:
+            msg["_voice_path"] = voice_path
+        messages.append(msg)
+
+    print(f"  WhatsApp: сообщений — {len(messages)}")
+    return messages, contact
+
+
 def load_chat_folder(folder: Path) -> Tuple[List[dict], str, str]:
     all_msgs: List[dict] = []
     contact = ""
     srcs = []
 
+    # ── Instagram JSON (message_1.json, message_2.json, ...) ──────────
+    ig_files = sorted(folder.glob("message_*.json"))
+    _is_instagram = False
+    if ig_files:
+        try:
+            head = ig_files[0].read_bytes()[:300].decode("utf-8", errors="replace")
+            if '"participants"' in head:
+                _is_instagram = True
+                msgs, c = load_instagram_json(folder)
+                all_msgs.extend(msgs)
+                if not contact and c:
+                    contact = c
+                srcs.append("Instagram")
+        except Exception:
+            pass
+
+    # ── Telegram / VK JSON ──────────────────────────────────────────
     json_path = None
-    if (folder / "result.json").exists():
-        json_path = folder / "result.json"
-    else:
-        for p in sorted(folder.glob("*.json")):
-            try:
-                d = json.loads(p.read_bytes().decode("utf-8", errors="replace"))
-                if isinstance(d, dict) and ("messages" in d or "chats" in d):
-                    json_path = p
-                    break
-            except:
-                pass
+    if not _is_instagram:
+        if (folder / "result.json").exists():
+            json_path = folder / "result.json"
+        else:
+            for p in sorted(folder.glob("*.json")):
+                if re.match(r"message_\d+\.json", p.name):
+                    continue  # уже обработано выше
+                try:
+                    d = json.loads(p.read_bytes().decode("utf-8", errors="replace"))
+                    if isinstance(d, dict) and ("messages" in d or "chats" in d):
+                        json_path = p
+                        break
+                except:
+                    pass
 
     if json_path:
         msgs, c = load_tg_json(json_path, folder)
@@ -985,6 +1261,14 @@ def load_chat_folder(folder: Path) -> Tuple[List[dict], str, str]:
                 contact = c
             all_msgs.extend(msgs)
             srcs.append("VK")
+
+    # ── WhatsApp TXT ──────────────────────────────────────────────────
+    if (folder / "_chat.txt").exists():
+        msgs, c = load_whatsapp_txt(folder)
+        all_msgs.extend(msgs)
+        if not contact and c:
+            contact = c
+        srcs.append("WhatsApp")
 
     return all_msgs, contact, " + ".join(srcs) if srcs else "unknown"
 
@@ -1019,17 +1303,18 @@ def merge_consecutive(messages: list) -> list:
 # ──────────────────────────────────────────────
 
 def format_output(messages: list, sources: list, contact: str,
-                  fmt: str = "txt") -> str:
+                  fmt: str = "txt", show_timestamps: bool = True) -> str:
     """
     fmt: 'txt' — текстовый формат (по умолчанию)
          'md'  — Markdown формат
+    show_timestamps: False — убирает метки времени из вывода
     """
     if fmt == "md":
-        return _format_markdown(messages, sources, contact)
-    return _format_txt(messages, sources, contact)
+        return _format_markdown(messages, sources, contact, show_timestamps)
+    return _format_txt(messages, sources, contact, show_timestamps)
 
 
-def _format_txt(messages: list, sources: list, contact: str) -> str:
+def _format_txt(messages: list, sources: list, contact: str, show_timestamps: bool = True) -> str:
     lines = [
         "=" * 56,
         f"Переписка: {contact}",
@@ -1066,14 +1351,15 @@ def _format_txt(messages: list, sources: list, contact: str) -> str:
             ts = "??:??:??"
 
         text_lines = msg["text"].split("\n")
-        lines.append(f"{ts} {msg['sender']}: {text_lines[0]}")
+        prefix = f"{ts} " if show_timestamps else ""
+        lines.append(f"{prefix}{msg['sender']}: {text_lines[0]}")
         for line in text_lines[1:]:
             lines.append(f"  {line}")
 
     return "\n".join(lines)
 
 
-def _format_markdown(messages: list, sources: list, contact: str) -> str:
+def _format_markdown(messages: list, sources: list, contact: str, show_timestamps: bool = True) -> str:
     lines = [
         f"# Переписка: {contact}",
         "",
@@ -1128,7 +1414,8 @@ def _format_markdown(messages: list, sources: list, contact: str) -> str:
             lines.append(f"> {line.strip()}")
         # Основная строка с меткой времени
         first = content_lines[0] if content_lines else ""
-        lines.append(f"`{ts}` {sender_md}: {first}")
+        ts_prefix = f"`{ts}` " if show_timestamps else ""
+        lines.append(f"{ts_prefix}{sender_md}: {first}")
         for line in content_lines[1:]:
             lines.append(f"  {line}")
         lines.append("")
@@ -1220,6 +1507,7 @@ def main():
         total = 0
         for f in raw_valid:
             total += len(list(f.rglob("*.ogg")))
+            total += len(list(f.rglob("*.opus")))
             total += len(list(f.rglob("round_video_messages/*.mp4")))
         _voice_counter["total"] = total
         if total:
@@ -1306,7 +1594,10 @@ def process_folder(folder_path: str,
                    log_cb=None,
                    progress_cb=None,
                    date_from: str = "",
-                   date_to: str = "") -> Optional[str]:
+                   date_to: str = "",
+                   show_timestamps: bool = True,
+                   split_mode: str = "none") -> Optional[str]:
+    """split_mode: 'none' | 'month' | 'year'"""
     """
     Высокоуровневая функция для GUI.
     Возвращает путь к итоговому файлу или None при ошибке.
@@ -1371,7 +1662,7 @@ def process_folder(folder_path: str,
 
         _pre_voice: set = set()
         for _vdir in valid:
-            for _pat in ("voice_messages/*.ogg","voice_messages/*.oga","video_messages/*.mp4","*.ogg","*.oga"):
+            for _pat in ("voice_messages/*.ogg","voice_messages/*.oga","video_messages/*.mp4","audio/*.mp4","*.ogg","*.oga","*.opus"):
                 _pre_voice.update(_vdir.rglob(_pat) if "/" in _pat else _vdir.glob(_pat))
         _pre_total = len(_pre_voice)
         _voice_counter["total"] = _pre_total
@@ -1552,7 +1843,7 @@ def process_folder(folder_path: str,
         if not voice_paths_in_period and not (date_from or date_to):
             for v in valid:
                 for pat in ("voice_messages/*.ogg","voice_messages/*.oga",
-                            "video_messages/*.mp4","*.ogg","*.oga"):
+                            "video_messages/*.mp4","audio/*.mp4","*.ogg","*.oga"):
                     voice_paths_in_period.update(v.rglob(pat) if "/" in pat else v.glob(pat))
         audio_total = len(voice_paths_in_period)
         if audio_total > _pre_total: _voice_counter["total"] = audio_total
@@ -1597,16 +1888,43 @@ def process_folder(folder_path: str,
             safe = "chat"
 
         ext = ".md" if output_format == "md" else ".txt"
-        # Save file IN the selected folder (next to voice_messages etc.)
-        output_dir = folder  # always save inside the top-level folder user picked
-        out_path = output_dir / f"{safe}{ext}"
+        output_dir = folder
+        out_path = None
 
-        result = format_output(all_messages, sources, contact, output_format)
-        out_path.write_text(result, encoding="utf-8")
-
-        if progress_cb: progress_cb(1.0)
-        kb = out_path.stat().st_size // 1024
-        if log_cb: log_cb(f"\n✓ Готово → {out_path} ({kb} КБ)")
+        if split_mode in ("month", "year"):
+            from itertools import groupby
+            if split_mode == "month":
+                def _key(m): return f"{m['dt'].year}-{m['dt'].month:02d}" if m.get("dt") else ""
+            else:
+                def _key(m): return str(m["dt"].year) if m.get("dt") else ""
+            with_dt    = [m for m in all_messages if m.get("dt")]
+            without_dt = [m for m in all_messages if not m.get("dt")]
+            files_written = 0
+            for label, group in groupby(with_dt, key=_key):
+                if not label:
+                    continue
+                chunk = list(group)
+                chunk_path = output_dir / f"{safe}_{label}{ext}"
+                result = format_output(chunk, sources, contact, output_format, show_timestamps)
+                chunk_path.write_text(result, encoding="utf-8")
+                kb = chunk_path.stat().st_size // 1024
+                if log_cb: log_cb(f"  → {chunk_path.name} ({len(chunk)} сообщ., {kb} КБ)")
+                files_written += 1
+                out_path = chunk_path
+            if without_dt:
+                nd_path = output_dir / f"{safe}_no_date{ext}"
+                result = format_output(without_dt, sources, contact, output_format, show_timestamps)
+                nd_path.write_text(result, encoding="utf-8")
+                files_written += 1
+            if progress_cb: progress_cb(1.0)
+            if log_cb: log_cb(f"\n✓ Готово → {output_dir} ({files_written} файлов)")
+        else:
+            out_path = output_dir / f"{safe}{ext}"
+            result = format_output(all_messages, sources, contact, output_format, show_timestamps)
+            out_path.write_text(result, encoding="utf-8")
+            if progress_cb: progress_cb(1.0)
+            kb = out_path.stat().st_size // 1024
+            if log_cb: log_cb(f"\n✓ Готово → {out_path} ({kb} КБ)")
 
         _elapsed=_time.time()-_start_time
         _m,_s=divmod(int(_elapsed),60)
