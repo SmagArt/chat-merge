@@ -2,29 +2,39 @@
 setlocal EnableDelayedExpansion
 
 set "APPDIR=%~dp0"
-set "PY=%APPDIR%python\python.exe"
 set "LOGFILE=%APPDIR%install_log.txt"
-set "PTH=%APPDIR%python\python313._pth"
 
 echo %DATE% %TIME% START >> "%LOGFILE%"
 
-REM Write correct .pth (enables tkinter and site-packages)
-(
-    echo python313.zip
-    echo .
-    echo Lib\site-packages
-    echo import site
-) > "%PTH%"
-echo %DATE% %TIME% .pth ok >> "%LOGFILE%"
+REM Search Python 313, 312, 311, 310 in standard user locations
+set "PY="
+if exist "%USERPROFILE%\AppData\Local\Programs\Python\Python313\python.exe" set "PY=%USERPROFILE%\AppData\Local\Programs\Python\Python313\python.exe"
+if "!PY!"=="" if exist "%USERPROFILE%\AppData\Local\Programs\Python\Python312\python.exe" set "PY=%USERPROFILE%\AppData\Local\Programs\Python\Python312\python.exe"
+if "!PY!"=="" if exist "%USERPROFILE%\AppData\Local\Programs\Python\Python311\python.exe" set "PY=%USERPROFILE%\AppData\Local\Programs\Python\Python311\python.exe"
+if "!PY!"=="" if exist "%USERPROFILE%\AppData\Local\Programs\Python\Python310\python.exe" set "PY=%USERPROFILE%\AppData\Local\Programs\Python\Python310\python.exe"
 
-REM Install pip
-"%PY%" "%APPDIR%python\get-pip.py" --no-warn-script-location -q >> "%LOGFILE%" 2>&1
-echo %DATE% %TIME% pip exit=%ERRORLEVEL% >> "%LOGFILE%"
+REM Search via where (skip WindowsApps stub)
+if "!PY!"=="" (
+    for /f "delims=" %%i in ('where python 2^>nul') do (
+        echo %%i | findstr /i "WindowsApps" >nul
+        if errorlevel 1 if "!PY!"=="" set "PY=%%i"
+    )
+)
+
+if "!PY!"=="" (
+    echo %DATE% %TIME% ERROR: Python not found >> "%LOGFILE%"
+    exit /b 1
+)
+
+echo %DATE% %TIME% Python: !PY! >> "%LOGFILE%"
+
+REM Upgrade pip
+"!PY!" -m pip install --upgrade pip -q >> "%LOGFILE%" 2>&1
+echo %DATE% %TIME% pip upgrade exit=%ERRORLEVEL% >> "%LOGFILE%"
 
 REM Install base packages
-echo %DATE% %TIME% base packages >> "%LOGFILE%"
-"%PY%" -m pip install beautifulsoup4 customtkinter imageio-ffmpeg openai-whisper certifi tkinterdnd2 -q >> "%LOGFILE%" 2>&1
-echo %DATE% %TIME% base exit=%ERRORLEVEL% >> "%LOGFILE%"
+"!PY!" -m pip install beautifulsoup4 customtkinter imageio-ffmpeg openai-whisper certifi tkinterdnd2 -q >> "%LOGFILE%" 2>&1
+echo %DATE% %TIME% base packages exit=%ERRORLEVEL% >> "%LOGFILE%"
 
 REM NVIDIA detection — install CUDA torch if found
 powershell -NoProfile -Command "(Get-WmiObject Win32_VideoController).Name" 2>nul | findstr /i "nvidia" >nul

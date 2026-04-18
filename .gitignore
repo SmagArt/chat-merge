@@ -13,3 +13,6 @@ dist_installer/
 python-installer/
 *.spec
 build_log.txt
+*.flag
+install_log.txt
+launch_log.txt

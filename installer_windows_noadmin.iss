@@ -29,6 +29,7 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Дополнительно:"
+Name: "whisper"; Description: "Установить поддержку расшифровки голосовых сейчас (Whisper + PyTorch, 300 МБ – 2.5 ГБ)"; GroupDescription: "Компоненты:"; Flags: unchecked
 
 [Files]
 ; No Python installer — uses system Python (must be pre-installed)
@@ -52,7 +53,10 @@ Filename: "{app}\setup_base.bat"; WorkingDir: "{app}"; StatusMsg: "Устано�
 ; Step 2: Create pkgs_ok flag — launcher стартует сразу без проверок
 Filename: "cmd.exe"; Parameters: "/c echo done > ""{app}\pkgs_ok.flag"""; Flags: runhidden waituntilterminated
 
-; Step 3: Optional launch
+; Step 3: Whisper + PyTorch (optional, if checkbox selected)
+Filename: "{app}\setup_whisper.bat"; WorkingDir: "{app}"; StatusMsg: "Установка Whisper и PyTorch..."; Flags: waituntilterminated runhidden; Tasks: whisper
+
+; Step 4: Optional launch
 Filename: "{sys}\wscript.exe"; Parameters: """{app}\launcher_win.vbs"""; WorkingDir: "{app}"; Description: "Запустить {#AppName}"; Flags: nowait postinstall skipifsilent unchecked
 
 [UninstallDelete]
