@@ -13,6 +13,10 @@ except ImportError:
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
 
+if IS_WIN:
+    import ctypes
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SmagArt.MergeChat.2.4')
+
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD as _TkDnD
     _HAS_DND = True

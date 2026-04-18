@@ -926,7 +926,7 @@ def find_all_chat_folders(root: Path) -> List[Path]:
     for p in root.rglob("*.json"):
         try:
             head = p.read_bytes()[:300].decode("utf-8", errors="replace")
-            if '"messages"' in head or '"chats"' in head:
+            if '"messages"' in head or '"chats"' in head or '"participants"' in head:
                 found.add(p.parent)
         except:
             pass
