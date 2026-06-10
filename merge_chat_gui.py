@@ -13,9 +13,11 @@ except ImportError:
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
 
+APP_USER_MODEL_ID = "com.smagart.mergechat"
+
 if IS_WIN:
     import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('SmagArt.MergeChat.2.4')
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD as _TkDnD
@@ -24,11 +26,43 @@ except ImportError:
     _HAS_DND = False
     DND_FILES = None
 
-try:
-    import whisper as _wchk; del _wchk
-    _WHISPER_OK = True
-except ImportError:
-    _WHISPER_OK = False
+# ── Локальная папка для Whisper/torch — не системная.
+# Так удаление MergeChat реально удаляет всё, что прога ставила через UI,
+# и `Whisper не установлен` снова показывается после переустановки.
+def _local_packages_dir() -> Path:
+    return Path(__file__).resolve().parent / "local_packages"
+
+LOCAL_PKGS = _local_packages_dir()
+LOCAL_PKGS.mkdir(parents=True, exist_ok=True)
+if str(LOCAL_PKGS) not in sys.path:
+    sys.path.insert(0, str(LOCAL_PKGS))
+
+# Модели Whisper (tiny…large .pt) храним внутри папки проги — whisper_models/,
+# а не в общем ~/.cache/whisper. Так удаление MergeChat уносит модели с собой.
+# См. правило изоляции служебных файлов (memory/feedback_isolate_app_files.md).
+WHISPER_MODELS = Path(__file__).resolve().parent / "whisper_models"
+# Legacy-кэш: до v2.5 модели качались в общий ~/.cache/whisper — чистим его
+# при «Удалить Whisper», т.к. на старых установках там осели гигабайты.
+WHISPER_CACHE_LEGACY = Path.home() / ".cache" / "whisper"
+
+# Whisper «доступен для MergeChat» — ТОЛЬКО если whisper И torch лежат в
+# local_packages самой проги. Системный / пользовательский Python (voice-diarizer,
+# pip install --user, общий site-packages) намеренно игнорируем: иначе удаление
+# MergeChat не может вычистить Whisper, а баннер врёт о состоянии. Прога владеет
+# своим Whisper целиком. Раньше тут был find_spec — он находил whisper в чужом
+# Python (в т.ч. в общем %APPDATA%\Python user-site) и баннер не показывался.
+def _whisper_available() -> bool:
+    try:
+        return ((LOCAL_PKGS / "whisper").is_dir()
+                and (LOCAL_PKGS / "torch").is_dir())
+    except Exception:
+        return False
+
+_WHISPER_OK = _whisper_available()
+
+# Размер каждой модели — для подсказки «докачается ~X» в статусе модели.
+_MODEL_SIZE = {"tiny": "75 МБ", "base": "145 МБ", "small": "480 МБ",
+               "medium": "1.5 ГБ", "large": "2.9 ГБ"}
 
 # ВСЕГДА ctk.CTk - DnD инжектируется через _require() после создания окна
 _BaseApp = ctk.CTk
@@ -56,7 +90,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.4"
+VERSION = "2.7"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -94,37 +128,30 @@ SCRIPT = find_script()
 _cancel_event = threading.Event()
 
 
-def _whisper_ok():
-    try:
-        import whisper  # noqa
-        return True
-    except Exception:
-        return False
-
-
 def _has_nvidia():
     if not IS_WIN:
         return False
+    # wmic удалён начиная с Windows 11 24H2 → powershell + CIM
     try:
         out = subprocess.check_output(
-            ["wmic", "path", "win32_VideoController", "get", "name"],
-            creationflags=0x08000000, stderr=subprocess.DEVNULL, text=True)
-        return "nvidia" in out.lower()
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_VideoController).Name"],
+            creationflags=0x08000000, stderr=subprocess.DEVNULL,
+            text=True, timeout=10)
+        if "nvidia" in out.lower():
+            return True
+    except Exception:
+        pass
+    # Fallback: nvidia-smi лежит в System32 при установленном драйвере GeForce
+    try:
+        import shutil
+        return shutil.which("nvidia-smi") is not None
     except Exception:
         return False
 
 
 class App(_BaseApp):
     def __init__(self):
-        # Taskbar icon fix: Windows needs AppUserModelID set BEFORE window creation
-        if sys.platform == "win32":
-            try:
-                import ctypes as _ct
-                _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                    "com.smagart.mergechat"
-                )
-            except Exception:
-                pass
         ctk.CTk.__init__(self)
 
         global _theme
@@ -140,56 +167,130 @@ class App(_BaseApp):
         ctk.set_default_color_theme("blue")
 
         self.title("Merge Chat")
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(900, 720)
 
-        self.folder_var  = ctk.StringVar(value="")
-        self.author_var  = ctk.StringVar(value=self._cfg.get("author", "Вы"))
-        self.model_var   = ctk.StringVar(value=self._cfg.get("model", "small"))
-        self.merge_on    = self._cfg.get("merge_on", False)
-        self.fmt_md      = self._cfg.get("fmt_md", False)
-        self.show_ts     = self._cfg.get("show_ts", True)
-        # split_mode: "none" / "month" / "year"
-        self.split_mode  = self._cfg.get("split_mode", "none")
-        self.date_from       = ctk.StringVar(value="")   # не сохраняем — всегда пустой при старте
-        self.date_to         = ctk.StringVar(value="")
-        self.running     = False
-        self.output_path = None
-        self._mbtns      = {}
-        self._recent     = self._cfg.get("recent", [])
-
-        self._build()
-        if _whisper_ok():
-            self._whisper_banner.pack_forget()
-
-        W = 820
-        H_target = 1040 if _WHISPER_OK else 1100
-        self.update_idletasks()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        # Adaptive height: leave 80px for taskbar + margins
-        sh_avail = sh - 80
-        H = min(H_target, sh_avail)
-        if H < H_target:
-            # Shrink log box by the overflow amount
-            shrink = H_target - H
+        # WM_DELETE_WINDOW: жёсткий выход (os._exit) — иначе worker-thread с torch/whisper
+        # удерживает CUDA/модель в памяти и python.exe висит после закрытия окна.
+        # На следующий запуск это приводит к «прога уже запущена».
+        def _hard_close():
             try:
-                new_log_h = max(60, self.log.cget("height") - shrink)
-                self.log.configure(height=new_log_h)
+                _cancel_event.set()
+                self.destroy()
             except Exception:
                 pass
-        self.configure(fg_color=T("BG"))
-        self.geometry(f"{W}x{H}+{(sw-W)//2}+{max(0,(sh-H)//2-30)}")
+            os._exit(0)
+        self.protocol("WM_DELETE_WINDOW", _hard_close)
 
-        # Иконка — только Windows (.ico). На Mac без .app bundle иконку не задать
+        # Ранняя геометрия + фон — чтобы окно появилось с правильным размером/цветом сразу
+        W = 880
+        # Стартовая высота — компактно умещается на 1920×1080. Лог растягивается
+        # вверх до доступной высоты, юзер тянет окно для большего лога.
+        H_target = 960 if _WHISPER_OK else 1020
+        sw = self.winfo_screenwidth()
+        # Считаем геометрию от РАБОЧЕЙ области (экран минус панель задач), а не
+        # от полного экрана — иначе окно с кнопкой «Запустить» уезжает под таскбар.
+        wa_w, wa_h = self._work_area()
+        self._H_target = H_target
+        # ~56px запас на заголовок окна и рамку, чтобы всё окно влезло целиком
+        H = min(H_target, wa_h - 56)
+        W = min(W, wa_w - 40)
+        y = max(0, (wa_h - H - 40) // 2)
+        self.configure(fg_color=T("BG"))
+        self.geometry(f"{W}x{H}+{(sw-W)//2}+{y}")
+
+        # Иконка сразу — ctypes Load/Send отложим на after(300)
         if IS_WIN:
             _ico = self._find_icon()
             if _ico:
-                # Ставим дважды: сразу + после полной инициализации окна
                 try:
                     self.iconbitmap(default=str(_ico))
                 except Exception:
                     pass
                 self.after(300, lambda p=_ico: self._set_win_taskbar_icon(p))
 
+        # Splash overlay — виден пока идёт тяжёлая сборка UI
+        self._splash = ctk.CTkLabel(
+            self, text="Загрузка…",
+            font=ctk.CTkFont("Segoe UI" if IS_WIN else "SF Pro Display", 18),
+            text_color=T("SUB"))
+        self._splash.place(relx=0.5, rely=0.5, anchor="center")
+        self.update()  # принудительная отрисовка splash до тяжёлой работы
+
+        # StringVars (быстро, но нужны _build'у)
+        self.folder_var  = ctk.StringVar(value="")
+        self.author_var  = ctk.StringVar(value=self._cfg.get("author", "Вы"))
+        self.my_display_var   = ctk.StringVar(value=self._cfg.get("my_display", ""))
+        self.peer_display_var = ctk.StringVar(value=self._cfg.get("peer_display", ""))
+        self.model_var   = ctk.StringVar(value=self._cfg.get("model", "small"))
+        self.merge_on    = self._cfg.get("merge_on", False)
+        self.fmt_md      = self._cfg.get("fmt_md", False)
+        self.show_ts     = self._cfg.get("show_ts", True)
+        self.split_mode  = self._cfg.get("split_mode", "none")
+        self.auto_open   = self._cfg.get("auto_open", False)
+        self.show_src    = self._cfg.get("show_src", False)
+        self.date_from   = ctk.StringVar(value="")   # не сохраняем — всегда пустой при старте
+        self.date_to     = ctk.StringVar(value="")
+        self.running     = False
+        self.output_path = None
+        self._mbtns      = {}
+        self._recent     = self._cfg.get("recent", [])
+
+        # Тяжёлую сборку откладываем — mainloop отрисует splash и вызовет callback
+        self.after(10, self._deferred_init)
+
+    def _work_area(self):
+        """(width, height) рабочей области экрана — без панели задач Windows."""
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        if IS_WIN:
+            try:
+                import ctypes
+                from ctypes import wintypes
+                rect = wintypes.RECT()
+                # SPI_GETWORKAREA = 0x0030 → прямоугольник без панели задач
+                if ctypes.windll.user32.SystemParametersInfoW(
+                        0x0030, 0, ctypes.byref(rect), 0):
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    if w > 0 and h > 0:
+                        return w, h
+            except Exception:
+                pass
+        return sw, sh
+
+    def _deferred_init(self):
+        self._build()
+        self._update_model_status()
+        self.update_idletasks()
+        # Подгоняем окно по реальной требуемой высоте, гарантируя видимый лог.
+        # Логика: измеряем требуемую высоту всего окна (лог при штатных 200px).
+        #  • влезает в рабочую область → ставим окно ровно по содержимому
+        #    (без пустоты снизу), лог 200px виден целиком;
+        #  • не влезает → ужимаем ТОЛЬКО лог до пола 140px, окно = рабочая область.
+        # Так нижняя панель «Запустить» никогда не срезается, а лог не схлопывается.
+        LOG_FLOOR = 140
+        try:
+            avail_h = self._work_area()[1] - 56
+            req = self.winfo_reqheight()
+            if req > avail_h:
+                over = req - avail_h
+                log_h = max(LOG_FLOOR, int(self.log.cget("height")) - over)
+                self.log.configure(height=log_h)
+                self.update_idletasks()
+                req = self.winfo_reqheight()
+            H = min(req, avail_h)
+            cur_w = max(self.winfo_width(), 900)
+            x, y = self.winfo_x(), self.winfo_y()
+            # не даём окну уехать под верх экрана при росте высоты
+            if y < 0:
+                y = 0
+            self.geometry(f"{cur_w}x{H}+{x}+{y}")
+        except Exception:
+            pass
+        try:
+            self._splash.destroy()
+        except Exception:
+            pass
         if _HAS_DND:
             try:
                 _TkDnD._require(self)
@@ -263,12 +364,16 @@ class App(_BaseApp):
         try:
             self._cfg.update({
                 "author":   self.author_var.get(),
+                "my_display":   self.my_display_var.get(),
+                "peer_display": self.peer_display_var.get(),
                 "model":    self.model_var.get(),
                 "theme":    _theme,
                 "fmt_md":    self.fmt_md,
                 "show_ts":   self.show_ts,
                 "split_mode": self.split_mode,
                 "merge_on": self.merge_on,
+                "auto_open": self.auto_open,
+                "show_src": self.show_src,
                 "recent":   self._recent,
                 # dates not saved — always empty on start
             })
@@ -302,9 +407,22 @@ class App(_BaseApp):
 
     def _on_dnd_drop(self, event):
         path = event.data.strip().strip("{}")
-        if Path(path).is_dir():
+        p = Path(path)
+        if p.is_dir():
             self.folder_var.set(path)
             self.flbl.configure(text=path, text_color=T("TEXT"))
+            self._add_recent(path)
+            self._save_cfg()
+        elif p.is_file():
+            # Файл принимаем, режим определит _run по расширению
+            self.folder_var.set(path)
+            icon = "🎙 " if p.suffix.lower() in {
+                ".mp3",".wav",".m4a",".ogg",".oga",".opus",
+                ".aac",".flac",".webm",".amr",".mp4"
+            } else ""
+            self.flbl.configure(text=f"{icon}{path}", text_color=T("TEXT"))
+            self._add_recent(path)
+            self._save_cfg()
 
     def _toggle_fmt(self):
         self.fmt_md = not self.fmt_md
@@ -312,40 +430,42 @@ class App(_BaseApp):
             self._fmt_btn.configure(text="📝 MD", fg_color=T("ACCENT"), text_color="white")
         else:
             self._fmt_btn.configure(text="📄 TXT", fg_color=T("MUTED"), text_color=T("SUB"))
+        self._clear_preset_highlight()
+
+    def _split_labels(self):
+        return {"none":  ("📄 один файл",  T("SURFACE"), T("BORDER"), T("SUB")),
+                "month": ("📅 по месяцам", T("ACCENT"),  T("ACCENT"), "white"),
+                "year":  ("📆 по годам",   T("GREEN"),   T("GREEN"),  "white")}
 
     def _toggle_split(self):
         cycle = {"none": "month", "month": "year", "year": "none"}
         self.split_mode = cycle[self.split_mode]
-        labels = {"none":  ("📄 один файл",  T("SURFACE"), T("BORDER"), T("SUB")),
-                  "month": ("📅 по месяцам", T("ACCENT"),  T("ACCENT"), "white"),
-                  "year":  ("📆 по годам",   T("GREEN"),   T("GREEN"),  "white")}
-        txt, fg, bc, tc = labels[self.split_mode]
+        txt, fg, bc, tc = self._split_labels()[self.split_mode]
         self._split_btn.configure(text=txt, fg_color=fg, border_color=bc, text_color=tc)
+        self._clear_preset_highlight()
 
     def _toggle_ts(self):
         self.show_ts = not self.show_ts
         if self.show_ts:
-            self._ts_btn.configure(text="🕐 ВКЛ", fg_color=T("SURFACE"),
-                                   border_color=T("BORDER"), text_color=T("SUB"))
-        else:
-            self._ts_btn.configure(text="🕐 ВЫКЛ", fg_color=T("ACCENT"),
+            self._ts_btn.configure(text="🕐 [HH:MM]", fg_color=T("ACCENT"),
                                    border_color=T("ACCENT"), text_color="white")
+        else:
+            self._ts_btn.configure(text="🕐 без времени", fg_color=T("SURFACE"),
+                                   border_color=T("BORDER"), text_color=T("SUB"))
+        self._clear_preset_highlight()
+
+    def _toggle_src(self):
+        self.show_src = not self.show_src
+        if self.show_src:
+            self._src_btn.configure(text="🏷 [TG]", fg_color=T("ACCENT"),
+                                    border_color=T("ACCENT"), text_color="white")
+        else:
+            self._src_btn.configure(text="🏷 без меток", fg_color=T("SURFACE"),
+                                    border_color=T("BORDER"), text_color=T("SUB"))
+        self._clear_preset_highlight()
 
     def _build(self):
         P = 28
-
-        # Декоративная вертикальная полоска справа
-        deco_panel = ctk.CTkFrame(self, fg_color=T("SURFACE"),
-                                   width=22, height=980, corner_radius=0)
-        deco_panel.place(x=798, y=0)
-        deco_panel.lower()
-        for txt, ypos, fs in [("TG", 140, 12), ("VK", 300, 10), ("💬", 480, 13), ("✈", 660, 17)]:
-            lbl = ctk.CTkLabel(deco_panel, text=txt,
-                               font=ctk.CTkFont("Arial", fs, "bold"),
-                               text_color=T("SUB"), fg_color="transparent",
-                               width=22, height=30, anchor="center")
-            lbl.place(x=0, y=ypos)
-            lbl.lower()
 
         hdr = ctk.CTkFrame(self, fg_color="transparent")
         hdr.pack(fill="x", padx=P, pady=(26, 0))
@@ -362,35 +482,58 @@ class App(_BaseApp):
 
 
 
-        ctk.CTkButton(right_hdr, text="ℹ  О программе",
-                      width=136, height=34, font=self._f(12),
+        ctk.CTkButton(right_hdr, text="О программе",
+                      width=120, height=32, font=self._f(12),
                       fg_color=T("MUTED"), hover_color=T("BORDER"),
-                      text_color=T("SUB"), corner_radius=8,
+                      text_color=T("SUB"), corner_radius=10,
                       command=self._show_about).pack(side="right")
+        ctk.CTkButton(right_hdr, text="Справка",
+                      width=100, height=32, font=self._f(12),
+                      fg_color=T("MUTED"), hover_color=T("BORDER"),
+                      text_color=T("SUB"), corner_radius=10,
+                      command=self._show_help).pack(side="right", padx=(0, 8))
+        ctk.CTkButton(right_hdr, text="⬇ Выгрузить из ВК",
+                      width=160, height=32, font=self._f(12, "bold"),
+                      fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
+                      text_color="white", corner_radius=10,
+                      command=self._show_vk_fetch_dialog).pack(side="right", padx=(0, 8))
 
         ctk.CTkFrame(self, fg_color=T("ACCENT"), height=2,
                      corner_radius=1).pack(fill="x", padx=P, pady=(14, 0))
         self._gap(14)
 
-        self._section("1 · Папка с перепиской")
+        self._section("1 · Источник: переписка или аудио")
         self._gap(6)
 
         fc = ctk.CTkFrame(self, fg_color=T("CARD"), corner_radius=14,
                           border_color=T("BORDER"), border_width=1)
         fc.pack(fill="x", padx=P)
 
+        _hint_dnd = " · перетащи сюда" if _HAS_DND else ""
+        _src_hint_row = ctk.CTkFrame(fc, fg_color="transparent")
+        _src_hint_row.pack(fill="x", padx=16, pady=(10, 0))
+        ctk.CTkLabel(_src_hint_row,
+                     text=f"Папка переписки или аудио-файл{_hint_dnd}",
+                     font=self._f(11), text_color=T("SUB"),
+                     anchor="w").pack(side="left")
+        self._help_icon(_src_hint_row,
+            "Папка с экспортом из мессенджера, отдельный аудиофайл "
+            "или папка с аудио. Формат определяется автоматически.\n\n"
+            "Подробности — в README."
+        ).pack(side="left", padx=(8, 0))
+
         fi = ctk.CTkFrame(fc, fg_color="transparent")
-        fi.pack(fill="x", padx=16, pady=(14, 6))
+        fi.pack(fill="x", padx=16, pady=(8, 6))
 
         hint = " (или перетащи сюда)" if _HAS_DND else ""
-        self.flbl = ctk.CTkLabel(fi, text="Папка не выбрана" + hint,
+        self.flbl = ctk.CTkLabel(fi, text="Не выбрано" + hint,
                                   font=self._mono(12), text_color=T("SUB"),
                                   anchor="w", wraplength=540)
         self.flbl.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(fi, text="Выбрать…", width=110, height=34,
+        ctk.CTkButton(fi, text="Выбрать…", width=130, height=34,
                       font=self._f(13, "bold"),
                       fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
-                      corner_radius=8, command=self._pick_folder).pack(side="right")
+                      corner_radius=8, command=self._pick_source).pack(side="right")
 
         fr = ctk.CTkFrame(fc, fg_color="transparent")
         fr.pack(fill="x", padx=16, pady=(0, 10))
@@ -420,13 +563,102 @@ class App(_BaseApp):
         si = ctk.CTkFrame(sc, fg_color="transparent")
         si.pack(fill="x", padx=16, pady=14)
 
+        # Пресеты — быстро накатить типичный набор настроек.
+        rp = ctk.CTkFrame(si, fg_color="transparent"); rp.pack(fill="x", pady=5)
+        ctk.CTkLabel(rp, text="Пресет", font=self._f(13),
+                     text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
+        self._preset_btns = {}
+        for label, key, desc in [
+            ("💬 Диалог", "dialog",  "1-на-1: время вкл, метки источников выкл, один файл."),
+            ("👥 Группа", "forum",   "Групповой чат: метки источников вкл, имена сохранены, один файл."),
+            ("📰 Канал",  "channel", "Канал/бот: MD-формат, разбивка по месяцам, время вкл."),
+        ]:
+            b = ctk.CTkButton(rp, text=label, width=110, height=30,
+                              font=self._f(12), fg_color=T("SURFACE"),
+                              hover_color=T("BORDER"), text_color=T("SUB"),
+                              border_color=T("BORDER"), border_width=1,
+                              corner_radius=7,
+                              command=lambda k=key: self._apply_preset(k))
+            b.pack(side="left", padx=(0, 6))
+            self._tip(b, desc)
+            self._preset_btns[key] = b
+        self._active_preset = None
+        self._help_icon(rp,
+            "Готовые наборы настроек.\n"
+            "Диалог — личная переписка. Группа — общий чат. "
+            "Канал — поток сообщений с разбивкой по месяцам."
+        ).pack(side="left", padx=(8, 0))
+
+        ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
+
+        # ── Твоё имя ──
+        # Используется одновременно: (1) для распознавания твоих сообщений в TG/VK,
+        # (2) как подпись в выводе. IG/WA теперь авто-определяют «себя» из participants.
+        # Если хочешь разные имена для матчинга и для вывода — раскрой «Дополнительно».
         r1 = ctk.CTkFrame(si, fg_color="transparent"); r1.pack(fill="x", pady=5)
-        ctk.CTkLabel(r1, text="Твоё имя (как в Telegram)", font=self._f(13),
+        ctk.CTkLabel(r1, text="Твоё имя", font=self._f(13),
                      text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
         ctk.CTkEntry(r1, textvariable=self.author_var, width=220, height=34,
                      font=self._f(13), fg_color=T("SURFACE"),
                      border_color=T("BORDER"), text_color=T("TEXT"),
+                     placeholder_text="Ваше имя",
                      corner_radius=8).pack(side="left")
+        self._help_icon(r1,
+            "Ваше имя в мессенджерах. Нужно чтобы отделить ваши сообщения "
+            "от сообщений собеседника, и так же подписать их в готовом файле.\n\n"
+            "Если в разных мессенджерах вы под разными вариантами — "
+            "перечислите через запятую."
+        ).pack(side="left", padx=(8, 0))
+
+        # ── Дополнительно: разные имена для распознавания и для вывода ──
+        adv_toggle_var = ctk.BooleanVar(
+            value=bool(self.my_display_var.get() or self.peer_display_var.get()))
+        self._adv_names_var = adv_toggle_var
+
+        r_adv_h = ctk.CTkFrame(si, fg_color="transparent"); r_adv_h.pack(fill="x", pady=(2, 0))
+        adv_chk = ctk.CTkCheckBox(
+            r_adv_h, text="Дополнительно: разные имена для вывода",
+            variable=adv_toggle_var, onvalue=True, offvalue=False,
+            font=self._f(11), text_color=T("SUB"),
+            fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
+            border_color=T("BORDER"), checkbox_width=16, checkbox_height=16,
+            corner_radius=4)
+        adv_chk.pack(side="left")
+        self._help_icon(r_adv_h,
+            "Включите если в готовом файле имена должны выглядеть иначе, "
+            "чем в мессенджере. Например, у собеседника в разных мессенджерах "
+            "разные имена — задайте одно общее."
+        ).pack(side="left", padx=(8, 0))
+
+        # Контейнер с полями вывода — показывается/скрывается по чекбоксу
+        r1b = ctk.CTkFrame(si, fg_color="transparent")
+        ctk.CTkLabel(r1b, text="Имена в выводе", font=self._f(13),
+                     text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
+        ctk.CTkLabel(r1b, text="Я →", font=self._f(11),
+                     text_color=T("SUB")).pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(r1b, textvariable=self.my_display_var, width=110, height=32,
+                     font=self._f(12), fg_color=T("SURFACE"),
+                     border_color=T("BORDER"), text_color=T("TEXT"),
+                     placeholder_text="как «Твоё имя»", corner_radius=8).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(r1b, text="Собеседник →", font=self._f(11),
+                     text_color=T("SUB")).pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(r1b, textvariable=self.peer_display_var, width=160, height=32,
+                     font=self._f(12), fg_color=T("SURFACE"),
+                     border_color=T("BORDER"), text_color=T("TEXT"),
+                     placeholder_text="оставить как есть",
+                     corner_radius=8).pack(side="left")
+
+        def _toggle_adv_names(*_):
+            if adv_toggle_var.get():
+                r1b.pack(fill="x", pady=5, after=r_adv_h)
+            else:
+                r1b.pack_forget()
+                # При выключении — очищаем оба поля чтобы вывод использовал «Твоё имя»
+                self.my_display_var.set("")
+                self.peer_display_var.set("")
+        adv_chk.configure(command=_toggle_adv_names)
+        if adv_toggle_var.get():
+            r1b.pack(fill="x", pady=5, after=r_adv_h)
 
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
 
@@ -434,6 +666,7 @@ class App(_BaseApp):
         ctk.CTkLabel(r2, text="Модель Whisper", font=self._f(13),
                      text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
         mf = ctk.CTkFrame(r2, fg_color="transparent"); mf.pack(side="left")
+        # Иконка справки появится после ряда кнопок (см. ниже)
         cur = self._cfg.get("model", "small")
         for m in ["tiny", "base", "small", "medium", "large"]:
             b = ctk.CTkButton(mf, text=m, width=70, height=30, font=self._f(12),
@@ -443,57 +676,42 @@ class App(_BaseApp):
                               command=lambda v=m: self._pick_model(v))
             b.pack(side="left", padx=3)
             self._mbtns[m] = b
+        self._help_icon(r2,
+            "Качество распознавания голосовых.\n"
+            "Больше — точнее, но медленнее и больше места на диске.\n"
+            "Для русского рекомендуется medium."
+        ).pack(side="left", padx=(8, 0))
 
-        # Баннер "Whisper не установлен" — показывается если whisper недоступен
-        if not _WHISPER_OK:
-            self._whisper_banner = ctk.CTkFrame(
-                si, fg_color="#2A1A00", corner_radius=8,
-                border_color="#D97706", border_width=1)
-            self._whisper_banner.pack(fill="x", pady=(8, 0))
-            _wb = ctk.CTkFrame(self._whisper_banner, fg_color="transparent")
-            _wb.pack(fill="x", padx=12, pady=8)
-            ctk.CTkLabel(_wb, text="Whisper не установлен — голосовые не будут расшифрованы",
-                         font=self._f(12), text_color="#FCD34D", anchor="w").pack(side="left", fill="x", expand=True)
-            self._install_btn = ctk.CTkButton(
-                _wb, text="Установить", width=140, height=30,
-                font=self._f(12, "bold"), fg_color="#D97706",
-                hover_color="#B45309", text_color="white",
-                corner_radius=7, command=self._install_whisper)
-            self._install_btn.pack(side="right", padx=(8, 0))
-        else:
-            self._whisper_banner = None
+        # Статус выбранной модели: скачана / докачается. Модели тянутся при
+        # первом запуске в whisper_models/ — тут видно, что уже готово.
+        # Зелёная рамка у кнопки = модель скачана (см. _update_model_status).
+        self._model_status = ctk.CTkLabel(si, text="", font=self._f(10),
+                                          text_color=T("SUB"), anchor="w")
+        self._model_status.pack(fill="x", padx=(244, 0), pady=(2, 0))
 
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
 
-        self._whisper_banner = ctk.CTkFrame(si, fg_color="#261A08", corner_radius=8,
+        self._whisper_banner = ctk.CTkFrame(si, fg_color="#261A08", corner_radius=10,
                                              border_color="#5A3A10", border_width=1)
         ctk.CTkLabel(self._whisper_banner,
-                     text="⚠  Whisper не установлен — голосовые расшифровываться не будут",
-                     font=self._f(11), text_color="#E8944A").pack(side="left", padx=(10, 4), pady=7)
+                     text="Whisper не установлен — голосовые не расшифруются",
+                     font=self._f(11), text_color="#E8944A").pack(side="left", padx=(12, 4), pady=8)
         ctk.CTkButton(self._whisper_banner, text="Установить", width=100, height=26,
                       font=self._f(11), fg_color="#D07030", hover_color="#B05020",
-                      text_color="white", corner_radius=6,
-                      command=self._show_install_dialog).pack(side="right", padx=(4, 10), pady=7)
-        self._whisper_banner.pack(fill="x", pady=(0, 8))
+                      text_color="white", corner_radius=8,
+                      command=self._show_install_dialog).pack(side="right", padx=(4, 12), pady=8)
 
-        r3 = ctk.CTkFrame(si, fg_color="transparent"); r3.pack(fill="x", pady=5)
-        ctk.CTkLabel(r3, text="Объединять подряд идущие", font=self._f(13),
-                     text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
-        _m_text = "● ВКЛ"  if self.merge_on else "○ ВЫКЛ"
-        _m_fg   = T("GREEN") if self.merge_on else T("MUTED")
-        _m_hov  = T("GREEN2") if self.merge_on else T("BORDER")
-        _m_tc   = T("TEXT") if self.merge_on else T("SUB")
-        self.mbtn = ctk.CTkButton(r3, text=_m_text, width=90, height=30,
-                                   font=self._f(12, "bold"),
-                                   fg_color=_m_fg, hover_color=_m_hov,
-                                   text_color=_m_tc,
-                                   corner_radius=7, command=self._toggle_merge)
-        self.mbtn.pack(side="left")
-
-        ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
+        # Якорь для жёлтого баннера Whisper (раньше тут был тоггл «склеивать подряд»;
+        # фича ломает структуру каналов и паттерн переписки — убрана из UI,
+        # CLI-флаг --merge остаётся в merge_chat.py для совместимости).
+        r3 = ctk.CTkFrame(si, fg_color="transparent", height=1); r3.pack(fill="x")
+        self._whisper_banner_anchor = r3
+        self._whisper_installed = _WHISPER_OK
+        if not self._whisper_installed:
+            self._whisper_banner.pack(fill="x", pady=(0, 8), before=r3)
 
         r4 = ctk.CTkFrame(si, fg_color="transparent"); r4.pack(fill="x", pady=5)
-        ctk.CTkLabel(r4, text="Формат · Метки времени", font=self._f(13),
+        ctk.CTkLabel(r4, text="Формат · Время · Источник", font=self._f(13),
                      text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
         fmt_text = "📝 MD" if self.fmt_md else "📄 TXT"
         fmt_fg   = T("ACCENT") if self.fmt_md else T("MUTED")
@@ -503,17 +721,30 @@ class App(_BaseApp):
             fg_color=fmt_fg, hover_color=T("ACCENT2"),
             text_color=fmt_tc, corner_radius=7, command=self._toggle_fmt)
         self._fmt_btn.pack(side="left")
-        _ts_fg  = T("SURFACE") if self.show_ts else T("ACCENT")
-        _ts_bc  = T("BORDER")  if self.show_ts else T("ACCENT")
-        _ts_tc  = T("SUB")     if self.show_ts else "white"
-        _ts_txt = "🕐 ВКЛ"    if self.show_ts else "🕐 ВЫКЛ"
+        _ts_fg  = T("ACCENT")  if self.show_ts else T("SURFACE")
+        _ts_bc  = T("ACCENT")  if self.show_ts else T("BORDER")
+        _ts_tc  = "white"      if self.show_ts else T("SUB")
+        _ts_txt = "🕐 [HH:MM]" if self.show_ts else "🕐 без времени"
         self._ts_btn = ctk.CTkButton(
-            r4, text=_ts_txt, width=90, height=30, font=self._f(12, "bold"),
+            r4, text=_ts_txt, width=130, height=30, font=self._f(12, "bold"),
             fg_color=_ts_fg, hover_color=T("ACCENT2"), border_color=_ts_bc, border_width=1,
             text_color=_ts_tc, corner_radius=7, command=self._toggle_ts)
         self._ts_btn.pack(side="left", padx=(6, 0))
-        ctk.CTkLabel(r4, text="  TXT/MD · время сообщений вкл/выкл",
-                     font=self._f(10), text_color=T("SUB")).pack(side="left", padx=(8, 0))
+        _src_fg = T("ACCENT") if self.show_src else T("SURFACE")
+        _src_bc = T("ACCENT") if self.show_src else T("BORDER")
+        _src_tc = "white"     if self.show_src else T("SUB")
+        _src_txt = "🏷 [TG]"  if self.show_src else "🏷 без меток"
+        self._src_btn = ctk.CTkButton(
+            r4, text=_src_txt, width=120, height=30, font=self._f(12, "bold"),
+            fg_color=_src_fg, hover_color=T("ACCENT2"),
+            border_color=_src_bc, border_width=1,
+            text_color=_src_tc, corner_radius=7, command=self._toggle_src)
+        self._src_btn.pack(side="left", padx=(6, 0))
+        self._help_icon(r4,
+            "Формат файла, показывать ли время рядом с каждым сообщением "
+            "и помечать ли мессенджер-источник.\n\n"
+            "Подробности — в README."
+        ).pack(side="left", padx=(8, 0))
 
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
 
@@ -532,27 +763,95 @@ class App(_BaseApp):
                       fg_color=T("MUTED"), hover_color=T("BORDER"),
                       text_color=T("SUB"), corner_radius=7,
                       command=self._clear_dates).pack(side="left", padx=(0, 8))
-        _split_labels = {
-            "none":  ("📄 один файл",  T("SURFACE"), T("BORDER"), T("SUB")),
-            "month": ("📅 по месяцам", T("ACCENT"),  T("ACCENT"), "white"),
-            "year":  ("📆 по годам",   T("GREEN"),   T("GREEN"),  "white"),
-        }
-        _sp_txt, _sp_fg, _sp_bc, _sp_tc = _split_labels[self.split_mode]
+        _sp_txt, _sp_fg, _sp_bc, _sp_tc = self._split_labels()[self.split_mode]
         self._split_btn = ctk.CTkButton(
             df, text=_sp_txt, width=120, height=30, font=self._f(11, "bold"),
             fg_color=_sp_fg, hover_color=T("ACCENT2"), border_color=_sp_bc, border_width=1,
             text_color=_sp_tc, corner_radius=7, command=self._toggle_split)
         self._split_btn.pack(side="left", padx=(8, 0))
+        self._help_icon(df,
+            "Период — взять только сообщения в выбранном диапазоне дат.\n"
+            "Разбивка — один файл, или отдельные файлы по месяцам/годам "
+            "(удобно для очень длинных переписок)."
+        ).pack(side="left", padx=(8, 0))
+
+        ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
+
+        r6 = ctk.CTkFrame(si, fg_color="transparent"); r6.pack(fill="x", pady=5)
+        ctk.CTkLabel(r6, text="Фильтр (опционально)", font=self._f(13),
+                     text_color=T("TEXT"), width=240, anchor="w").pack(side="left")
+        self.filter_author = ctk.StringVar(value="")
+        self.filter_text   = ctk.StringVar(value="")
+        ctk.CTkLabel(r6, text="от:", font=self._f(11),
+                     text_color=T("SUB")).pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(r6, textvariable=self.filter_author, width=130, height=30,
+                     font=self._mono(11), fg_color=T("SURFACE"),
+                     border_color=T("BORDER"), border_width=1,
+                     placeholder_text="имя автора",
+                     text_color=T("TEXT"), corner_radius=7).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(r6, text="содержит:", font=self._f(11),
+                     text_color=T("SUB")).pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(r6, textvariable=self.filter_text, width=160, height=30,
+                     font=self._mono(11), fg_color=T("SURFACE"),
+                     border_color=T("BORDER"), border_width=1,
+                     placeholder_text="слово/regex",
+                     text_color=T("TEXT"), corner_radius=7).pack(side="left")
+        self._help_icon(r6,
+            "От — оставить только сообщения определённого автора "
+            "(можно часть имени, без учёта регистра).\n"
+            "Содержит — оставить только сообщения с заданным текстом.\n\n"
+            "Подробности и примеры — в README."
+        ).pack(side="left", padx=(8, 0))
 
         self._gap(16)
 
+        # ── Нижняя панель действий: пакуем side="bottom" ДО секции 3.
+        # pack отдаёт место expand-виджету (секция 3) и обрезает то, что
+        # запаковано после него. Раньше панель с кнопкой «Запустить» паковалась
+        # последней — при нехватке высоты её срезало целиком. Теперь она
+        # резервирует место снизу, а ужимается первым лог-бокс секции 3.
+        self._bf = ctk.CTkFrame(self, fg_color="transparent")
+        self._bf.pack(side="bottom", fill="x", padx=P, pady=(12, 24))
+        ctk.CTkFrame(self, fg_color=T("BORDER"), height=1).pack(
+            side="bottom", fill="x", padx=P, pady=(12, 0))
+
+        self.obtn = ctk.CTkButton(
+            self._bf, text="Открыть папку", width=170, height=46,
+            font=self._f(13), fg_color=T("MUTED"), hover_color=T("BORDER"),
+            text_color=T("SUB"), corner_radius=10, state="disabled",
+            command=self._open_output)
+        self.obtn.pack(side="left")
+
+        self._auto_open_var = ctk.BooleanVar(value=self.auto_open)
+        ctk.CTkCheckBox(
+            self._bf, text="открывать сразу после готово",
+            variable=self._auto_open_var,
+            onvalue=True, offvalue=False,
+            font=self._f(11), text_color=T("SUB"),
+            fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
+            border_color=T("BORDER"), checkbox_width=18, checkbox_height=18,
+            corner_radius=4, command=self._toggle_auto_open
+        ).pack(side="left", padx=(10, 0))
+
+        self.cbtn = ctk.CTkButton(
+            self._bf, text="Отмена", width=130, height=46, font=self._f(13),
+            fg_color="#7A1515", hover_color="#5A0F0F",
+            text_color="white", corner_radius=10, command=self._cancel)
+
+        self.rbtn = ctk.CTkButton(
+            self._bf, text="Запустить", width=190, height=46,
+            font=self._f(15, "bold"), fg_color=T("ACCENT"),
+            hover_color=T("ACCENT2"), corner_radius=10, command=self._run)
+        self.rbtn.pack(side="right")
+
+        # ── Секция 3 — заполняет всё место между настройками и нижней панелью.
         self._section("3 · Процесс")
         self._gap(6)
         pc = ctk.CTkFrame(self, fg_color=T("CARD"), corner_radius=14,
                           border_color=T("BORDER"), border_width=1)
-        pc.pack(fill="x", padx=P)
+        pc.pack(fill="both", expand=True, padx=P)
         pi = ctk.CTkFrame(pc, fg_color="transparent")
-        pi.pack(fill="both", padx=4, pady=4)
+        pi.pack(fill="both", expand=True, padx=4, pady=4)
 
         self.pbar = ctk.CTkProgressBar(pi, height=5, fg_color=T("SURFACE"),
                                         progress_color=T("ACCENT"), corner_radius=2)
@@ -565,167 +864,168 @@ class App(_BaseApp):
             pi, font=self._mono(12), fg_color=T("SURFACE"), text_color=T("TEXT"),
             border_color=T("BORDER"), border_width=1, corner_radius=10,
             wrap="word", height=200, activate_scrollbars=True)
-        self.log.pack(fill="x", padx=10, pady=(4, 4))
+        self.log.pack(fill="both", expand=True, padx=10, pady=(4, 4))
 
-        ctk.CTkButton(pi, text="📋  Скопировать лог", height=28, font=self._f(11),
+        ctk.CTkButton(pi, text="Скопировать лог", height=28, font=self._f(11),
                       fg_color="transparent", hover_color=T("BORDER"),
                       text_color=T("SUB"), corner_radius=6, anchor="w",
                       command=self._copy_log).pack(anchor="w", padx=10, pady=(0, 8))
 
-        ctk.CTkFrame(self, fg_color=T("BORDER"), height=1).pack(fill="x", padx=P, pady=(12, 0))
-        self._bf = ctk.CTkFrame(self, fg_color="transparent")
-        self._bf.pack(fill="x", padx=P, pady=(12, 24))
-
-        self.obtn = ctk.CTkButton(
-            self._bf, text="📂  Открыть папку", width=170, height=46,
-            font=self._f(13), fg_color=T("MUTED"), hover_color=T("BORDER"),
-            text_color=T("SUB"), corner_radius=12, state="disabled",
-            command=self._open_output)
-        self.obtn.pack(side="left")
-
-        self.cbtn = ctk.CTkButton(
-            self._bf, text="✕  Отмена", width=130, height=46, font=self._f(13),
-            fg_color="#7A1515", hover_color="#5A0F0F",
-            text_color="white", corner_radius=12, command=self._cancel)
-
-        self.rbtn = ctk.CTkButton(
-            self._bf, text="▶  Запустить", width=190, height=46,
-            font=self._f(15, "bold"), fg_color=T("ACCENT"),
-            hover_color=T("ACCENT2"), corner_radius=12, command=self._run)
-        self.rbtn.pack(side="right")
-
     def _gap(self, h=12):
         ctk.CTkFrame(self, fg_color="transparent", height=h).pack()
-
-    def _install_whisper(self):
-        bat = Path(__file__).parent / "setup_whisper.bat"
-        if not bat.exists():
-            self._log("setup_whisper.bat не найден рядом с программой")
-            return
-        self._install_btn.configure(state="disabled", text="Устанавливаю...")
-        self._log("--- Установка Whisper и PyTorch ---")
-        self._log("Идёт скачивание пакетов. При наличии NVIDIA — до 2.5 ГБ.")
-        self.pbar.configure(mode="determinate")
-        self.pbar.set(0.02)
-        self.plbl.configure(text="Запускаю...")
-
-        log_file = Path(__file__).parent / "install_log.txt"
-
-        # Phase markers written by setup_whisper.bat → (progress 0..1, status label)
-        _PHASES = {
-            "[PHASE:CHECKING]":            (0.05, "Проверяю окружение..."),
-            "[PHASE:DOWNLOAD_WHISPER]":    (0.10, "Скачиваю Whisper (~50 МБ)..."),
-            "[PHASE:DOWNLOAD_TORCH_CUDA]": (0.30, "Скачиваю PyTorch CUDA (~2.5 ГБ)..."),
-            "[PHASE:DOWNLOAD_TORCH_CPU]":  (0.30, "Скачиваю PyTorch CPU (~300 МБ)..."),
-            "[PHASE:DONE]":                (0.96, "Завершаю..."),
-        }
-
-        def _worker():
-            import time
-            _cur      = [0.02]
-            _phase    = [""]
-            _ts_start = [time.time()]
-
-            def _set(pct, label=None):
-                if pct > _cur[0]:
-                    _cur[0] = pct
-                    self.after(0, self.pbar.set, pct)
-                if label:
-                    _phase[0] = label
-                    elapsed = int(time.time() - _ts_start[0])
-                    m, s = divmod(elapsed, 60)
-                    suffix = f"  {m}:{s:02d}" if elapsed >= 5 else ""
-                    self.after(0, self.plbl.configure, {"text": label + suffix})
-
-            def _tick_elapsed():
-                if _phase[0]:
-                    elapsed = int(time.time() - _ts_start[0])
-                    m, s = divmod(elapsed, 60)
-                    self.after(0, self.plbl.configure,
-                               {"text": _phase[0] + f"  {m}:{s:02d}"})
-
-            try:
-                kw = {"creationflags": 0x08000000} if IS_WIN else {}
-                proc = subprocess.Popen(["cmd.exe", "/c", str(bat)], **kw)
-                last_pos = log_file.stat().st_size if log_file.exists() else 0
-                _tick = 0
-
-                while proc.poll() is None:
-                    time.sleep(0.5)
-                    _tick += 1
-
-                    # Slow creep during long torch download (max 0.88)
-                    if _cur[0] >= 0.29:
-                        elapsed = time.time() - _ts_start[0]
-                        creep = 0.30 + min(0.57, elapsed / 600 * 0.57)
-                        if creep > _cur[0]:
-                            _cur[0] = creep
-                            self.after(0, self.pbar.set, creep)
-
-                    # Update elapsed timer every 2 seconds
-                    if _tick % 4 == 0:
-                        _tick_elapsed()
-
-                    if not log_file.exists():
-                        continue
-                    size = log_file.stat().st_size
-                    if size <= last_pos:
-                        continue
-                    try:
-                        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                            f.seek(last_pos)
-                            chunk = f.read()
-                        last_pos = size
-                        for raw in chunk.splitlines():
-                            line = raw.strip()
-                            if not line:
-                                continue
-                            # Phase marker
-                            if line in _PHASES:
-                                pct, label = _PHASES[line]
-                                _set(pct, label)
-                                continue
-                            # Skip garbled pip progress lines (ANSI / box chars)
-                            if any(c in line for c in ('\x1b', '\r', '━', '─', '|')):
-                                continue
-                            self.after(0, lambda l=line: self._log(l))
-                    except Exception:
-                        pass
-
-                rc = proc.returncode
-                self.after(0, self.pbar.set, 1.0 if rc == 0 else _cur[0])
-                self.after(0, self.plbl.configure, {"text": ""})
-
-                if rc == 0:
-                    try:
-                        import whisper  # noqa
-                        self.after(0, self._on_whisper_installed)
-                    except ImportError:
-                        self.after(0, lambda: self._log("Установлено. Перезапустите программу."))
-                        self.after(0, lambda: self._install_btn.configure(
-                            state="normal", text="Перезапустить"))
-                else:
-                    self.after(0, lambda: self._log(
-                        f"Ошибка установки (код {rc}). Подробности: install_log.txt"))
-                    self.after(0, lambda: self._install_btn.configure(
-                        state="normal", text="Попробовать снова"))
-
-            except Exception as e:
-                self.after(0, lambda: self._log(f"Ошибка: {e}"))
-                self.after(0, lambda: self._install_btn.configure(
-                    state="normal", text="Попробовать снова"))
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_whisper_installed(self):
-        self._log("--- Whisper успешно установлен ---")
-        if self._whisper_banner:
-            self._whisper_banner.destroy()
-            self._whisper_banner = None
 
     def _section(self, txt):
         ctk.CTkLabel(self, text=txt, font=self._f(11, "bold"),
                      text_color=T("SUB")).pack(anchor="w", padx=28)
+
+    # ── Тултипы: лёгкое всплывающее окошко рядом с виджетом.
+    # Используется и для иконок «?», и для полноценных кнопок (можно повесить на любой widget).
+    def _tip(self, widget, text: str):
+        if not text:
+            return
+        state = {"tip": None}
+
+        def _show(_e=None):
+            if state["tip"] is not None:
+                return
+            import tkinter as _tk
+            # Размещаем тултип справа от виджета чтобы не перекрывать соседние ряды
+            x = widget.winfo_rootx() + widget.winfo_width() + 8
+            y = widget.winfo_rooty() - 4
+            tip = _tk.Toplevel(widget)
+            try:
+                tip.wm_overrideredirect(True)
+                tip.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+            tip.wm_geometry(f"+{x}+{y}")
+            tip.configure(bg="#1A1F2A")
+            _tk.Label(tip, text=text, justify="left",
+                      bg="#1A1F2A", fg="#E0E6F0",
+                      relief="solid", borderwidth=1,
+                      padx=12, pady=8, wraplength=300,
+                      font=("Segoe UI" if IS_WIN else "SF Pro Display", 10)
+                      ).pack()
+            state["tip"] = tip
+
+        def _hide(_e=None):
+            if state["tip"] is not None:
+                try: state["tip"].destroy()
+                except Exception: pass
+                state["tip"] = None
+
+        widget.bind("<Enter>", _show)
+        widget.bind("<Leave>", _hide)
+        widget.bind("<ButtonPress>", _hide)
+
+    def _help_icon(self, parent, tip_text: str):
+        """Маленькая иконка '?' — наводишь, всплывает подсказка."""
+        lbl = ctk.CTkLabel(parent, text="?", width=18, height=18,
+                           font=self._f(11, "bold"),
+                           text_color=T("SUB"), cursor="hand2")
+        self._tip(lbl, tip_text)
+        # При клике — тоже показать (для тач-устройств)
+        lbl.bind("<Button-1>", lambda _e, w=lbl, t=tip_text: self._tip_pin(w, t))
+        return lbl
+
+    def _tip_pin(self, anchor_widget, text: str):
+        """По клику на '?' — показать тултип на 4 секунды (если hover не сработал)."""
+        import tkinter as _tk
+        x = anchor_widget.winfo_rootx() + anchor_widget.winfo_width() + 8
+        y = anchor_widget.winfo_rooty() - 4
+        tip = _tk.Toplevel(anchor_widget)
+        try:
+            tip.wm_overrideredirect(True)
+            tip.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        tip.wm_geometry(f"+{x}+{y}")
+        tip.configure(bg="#1A1F2A")
+        _tk.Label(tip, text=text, justify="left",
+                  bg="#1A1F2A", fg="#E0E6F0",
+                  relief="solid", borderwidth=1,
+                  padx=12, pady=8, wraplength=300,
+                  font=("Segoe UI" if IS_WIN else "SF Pro Display", 10)).pack()
+        tip.after(4000, lambda: tip.destroy() if tip.winfo_exists() else None)
+
+    # ── Единый стиль модальных окон: оверлей-карточка поверх главного окна.
+    # Заменяет ctk.CTkToplevel — иначе диалог появляется на случайной позиции
+    # ОС, выглядит «отдельной программой». Оверлей всегда центрирован в окне.
+    def _overlay(self, title: str, width: int = 520, height: int = 420,
+                 backdrop: bool = False):
+        """Возвращает (overlay_root, content_frame, close_fn).
+        content_frame — куда класть содержимое диалога (pack/grid внутри).
+        width/height — желаемый минимум; карточка тянется до 85% окна.
+        backdrop=False (по умолчанию) — карточка кладётся поверх главного окна
+        без затемнения: главный UI остаётся виден вокруг карточки. Раньше дефолт
+        был True и закрашивал всё окно ровным SURFACE — маленькая карточка в
+        огромном тёмном поле выглядела как «сломанное пустое окно»."""
+        # Закрываем предыдущий оверлей если он есть (чтобы не накладывались)
+        prev = getattr(self, "_active_overlay", None)
+        if prev is not None:
+            try: prev.destroy()
+            except Exception: pass
+
+        # Карточка ровно того размера, что запросил вызывающий — не раздуваем
+        # на «75% окна», иначе мелкий контент тонет в пустоте.
+        self.update_idletasks()
+        avail_w = max(self.winfo_width(), 600)
+        avail_h = max(self.winfo_height(), 500)
+        card_w = min(width, max(420, avail_w - 80))
+        card_h = min(height, max(380, avail_h - 80))
+
+        if backdrop:
+            # Backdrop — слегка отличный от BG оттенок (SURFACE) чтобы было
+            # ощущение «модальный слой над окном», но без чёрного провала.
+            overlay = ctk.CTkFrame(self, fg_color=T("SURFACE"), corner_radius=0)
+            overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        else:
+            # Без затемнения: контейнер размером с карточку, центрирован.
+            # Главный интерфейс остаётся виден вокруг.
+            # width/height — ТОЛЬКО в конструкторе: CTk-виджеты не принимают их в .place().
+            overlay = ctk.CTkFrame(self, fg_color="transparent",
+                                   width=card_w + 10, height=card_h + 10)
+            overlay.place(relx=0.5, rely=0.5, anchor="center")
+        self._active_overlay = overlay
+
+        # Имитация тени
+        shadow = ctk.CTkFrame(overlay, fg_color=T("BG"), corner_radius=16,
+                              width=card_w + 6, height=card_h + 6)
+        shadow.place(relx=0.5, rely=0.5, anchor="center", x=2, y=3)
+
+        card = ctk.CTkFrame(overlay, fg_color=T("CARD"), corner_radius=14,
+                            border_color=T("BORDER"), border_width=1,
+                            width=card_w, height=card_h)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        card.pack_propagate(False)
+
+        def _close():
+            self._active_overlay = None
+            try: self.unbind("<Escape>")
+            except Exception: pass
+            try: overlay.destroy()
+            except Exception: pass
+
+        head = ctk.CTkFrame(card, fg_color="transparent", height=42)
+        head.pack(fill="x", padx=16, pady=(10, 0))
+        head.pack_propagate(False)
+        ctk.CTkLabel(head, text=title, font=self._f(15, "bold"),
+                     text_color=T("TEXT")).pack(side="left", pady=4)
+        ctk.CTkButton(head, text="✕", width=30, height=28, font=self._f(14),
+                      fg_color="transparent", hover_color=T("BORDER"),
+                      text_color=T("SUB"), corner_radius=6,
+                      command=_close).pack(side="right")
+        ctk.CTkFrame(card, fg_color=T("BORDER"), height=1).pack(
+            fill="x", padx=16, pady=(6, 0))
+
+        content = ctk.CTkFrame(card, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=16, pady=12)
+
+        # Esc → закрыть; клик вне карточки → закрыть
+        self.bind("<Escape>", lambda e: _close())
+        overlay.bind("<Button-1>",
+                     lambda e: _close() if e.widget is overlay else None)
+        return overlay, content, _close
 
     def _pick_date(self):
         """Range-picker: клик 1 = начало, клик 2 = конец."""
@@ -989,49 +1289,360 @@ class App(_BaseApp):
             self._add_recent(d)
             self._save_cfg()
 
+    def _pick_audio(self):
+        from tkinter import filedialog
+        types = [("Аудио", "*.mp3 *.wav *.m4a *.ogg *.oga *.opus *.aac *.flac *.webm *.amr *.mp4"),
+                 ("Все файлы", "*.*")]
+        f = filedialog.askopenfilename(title="Выберите аудио-файл", filetypes=types)
+        if f:
+            self.folder_var.set(f)
+            self.flbl.configure(text=f"🎙 {f}", text_color=T("TEXT"))
+            self._add_recent(f)
+            self._save_cfg()
+
+    def _pick_source(self):
+        """Оверлей с тремя вариантами: переписка / аудио-файл / папка только с аудио."""
+        overlay, content, close = self._overlay("Что обрабатываем?", width=480, height=340)
+
+        ctk.CTkLabel(content,
+                     text="Программа сама определит режим по содержимому,\n"
+                          "но проще выбрать явно.",
+                     font=self._f(11), text_color=T("SUB"),
+                     justify="center").pack(pady=(2, 14))
+
+        def _do(cmd):
+            close()
+            cmd()
+
+        ctk.CTkButton(content, text="📁  Папка с перепиской",
+                      height=44, font=self._f(13, "bold"),
+                      fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
+                      corner_radius=8,
+                      command=lambda: _do(self._pick_folder)
+                      ).pack(fill="x", pady=4)
+        ctk.CTkButton(content, text="🎙  Аудио-файл (один)",
+                      height=44, font=self._f(13),
+                      fg_color=T("SURFACE"), hover_color=T("BORDER"),
+                      border_color=T("BORDER"), border_width=1,
+                      text_color=T("TEXT"), corner_radius=8,
+                      command=lambda: _do(self._pick_audio)
+                      ).pack(fill="x", pady=4)
+        ctk.CTkButton(content, text="📂  Папка только с аудио",
+                      height=44, font=self._f(13),
+                      fg_color=T("SURFACE"), hover_color=T("BORDER"),
+                      border_color=T("BORDER"), border_width=1,
+                      text_color=T("TEXT"), corner_radius=8,
+                      command=lambda: _do(self._pick_folder)
+                      ).pack(fill="x", pady=4)
+
     def _pick_model(self, m):
         self.model_var.set(m)
         for k, b in self._mbtns.items():
             b.configure(fg_color=T("ACCENT") if k == m else T("SURFACE"))
+        self._update_model_status()
+
+    def _model_downloaded(self, m: str) -> bool:
+        """Скачана ли модель m — есть ли whisper_models/<m>*.pt.
+        Маска со звёздочкой: «large» сохраняется whisper'ом как large-v3.pt."""
+        try:
+            return any(WHISPER_MODELS.glob(f"{m}*.pt"))
+        except Exception:
+            return False
+
+    def _update_model_status(self):
+        """Подсветить кнопки моделей по факту скачивания (зелёная рамка) и
+        показать текстовый статус выбранной модели."""
+        if not hasattr(self, "_model_status"):
+            return
+        for k, b in self._mbtns.items():
+            try:
+                b.configure(border_color=T("GREEN") if self._model_downloaded(k)
+                            else T("BORDER"))
+            except Exception:
+                pass
+        m = self.model_var.get() if hasattr(self, "model_var") else ""
+        if not getattr(self, "_whisper_installed", False):
+            self._model_status.configure(
+                text="Whisper не установлен — модели расшифровки недоступны",
+                text_color=T("SUB"))
+        elif self._model_downloaded(m):
+            self._model_status.configure(
+                text=f"✓ модель «{m}» скачана, готова к работе",
+                text_color=T("GREEN"))
+        else:
+            sz = _MODEL_SIZE.get(m, "?")
+            self._model_status.configure(
+                text=f"↓ модель «{m}» ещё не скачана — докачается (~{sz}) "
+                     f"при первом запуске расшифровки",
+                text_color="#E8944A")
+
+    # ──────────────────────────────────────────────────────────
+    #  Выгрузка переписки из ВКонтакте (VK API) прямо из GUI
+    # ──────────────────────────────────────────────────────────
+    def _vk_accounts(self) -> dict:
+        """{подпись: токен}. Источники: tools/.env (dev-машина) + config
+        (vk_tokens, сохранённые через диалог; перекрывают .env по подписи)."""
+        accts = {}
+        label_map = {"VK_TOKEN": "Основной"}
+        try:
+            env_path = (SCRIPT.parent / "tools" / ".env") if SCRIPT else None
+            if env_path and env_path.exists():
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = (x.strip() for x in line.split("=", 1))
+                    if k.startswith("VK_TOKEN") and v:
+                        accts[label_map.get(k, k.replace("VK_TOKEN_", "").title() or "Основной")] = v
+        except Exception:
+            pass
+        for label, tok in (self._cfg.get("vk_tokens") or {}).items():
+            if tok:
+                accts[label] = tok
+        return accts
+
+    def _show_vk_fetch_dialog(self):
+        vk_script = (SCRIPT.parent / "tools" / "vk_fetch_history.py") if SCRIPT else None
+        overlay, content, close = self._overlay(
+            "Выгрузить из ВКонтакте", width=620, height=560)
+
+        if not vk_script or not vk_script.exists():
+            ctk.CTkLabel(content,
+                         text="Не найден tools/vk_fetch_history.py рядом с программой.",
+                         font=self._f(12), text_color="#f87171",
+                         wraplength=540, justify="left").pack(pady=20)
+            return
+
+        ctk.CTkLabel(content,
+                     text="Тянет историю диалога напрямую через VK API (с пересланными).\n"
+                          "Токен — на vkhost.github.io (Kate Mobile → Разрешить).",
+                     font=self._f(11), text_color=T("SUB"),
+                     justify="left", anchor="w").pack(fill="x", pady=(0, 10))
+
+        accounts = self._vk_accounts()
+        acc_labels = list(accounts.keys())
+
+        # ── Аккаунт (сохранённые токены) ──
+        row_acc = ctk.CTkFrame(content, fg_color="transparent"); row_acc.pack(fill="x", pady=4)
+        ctk.CTkLabel(row_acc, text="Аккаунт", font=self._f(12),
+                     text_color=T("TEXT"), width=110, anchor="w").pack(side="left")
+        acc_var = ctk.StringVar(value=acc_labels[0] if acc_labels else "— вставь токен ниже —")
+        acc_menu = ctk.CTkOptionMenu(
+            row_acc, values=acc_labels or ["— вставь токен ниже —"], variable=acc_var,
+            width=200, height=30, font=self._f(12),
+            fg_color=T("SURFACE"), button_color=T("BORDER"),
+            button_hover_color=T("ACCENT"), text_color=T("TEXT"),
+            dropdown_fg_color=T("SURFACE"))
+        acc_menu.pack(side="left")
+
+        # ── Токен вручную (override) + запомнить ──
+        row_tok = ctk.CTkFrame(content, fg_color="transparent"); row_tok.pack(fill="x", pady=4)
+        ctk.CTkLabel(row_tok, text="или токен", font=self._f(12),
+                     text_color=T("SUB"), width=110, anchor="w").pack(side="left")
+        tok_var = ctk.StringVar(value="")
+        ctk.CTkEntry(row_tok, textvariable=tok_var, height=30, font=self._mono(11),
+                     fg_color=T("SURFACE"), border_color=T("BORDER"), text_color=T("TEXT"),
+                     placeholder_text="vk1.a.… (перекрывает выбранный аккаунт)",
+                     corner_radius=8).pack(side="left", fill="x", expand=True)
+
+        row_rem = ctk.CTkFrame(content, fg_color="transparent"); row_rem.pack(fill="x", pady=(0, 4))
+        rem_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(row_rem, text="запомнить токен как:", variable=rem_var,
+                        font=self._f(11), text_color=T("SUB"),
+                        fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
+                        border_color=T("BORDER"), checkbox_width=16, checkbox_height=16,
+                        corner_radius=4).pack(side="left", padx=(110, 6))
+        rem_label_var = ctk.StringVar(value="")
+        ctk.CTkEntry(row_rem, textvariable=rem_label_var, width=140, height=26,
+                     font=self._f(11), fg_color=T("SURFACE"), border_color=T("BORDER"),
+                     text_color=T("TEXT"), placeholder_text="подпись",
+                     corner_radius=6).pack(side="left")
+
+        # ── peer_id ──
+        row_peer = ctk.CTkFrame(content, fg_color="transparent"); row_peer.pack(fill="x", pady=4)
+        ctk.CTkLabel(row_peer, text="peer_id", font=self._f(12),
+                     text_color=T("TEXT"), width=110, anchor="w").pack(side="left")
+        peer_var = ctk.StringVar(value="")
+        ctk.CTkEntry(row_peer, textvariable=peer_var, width=200, height=30, font=self._mono(12),
+                     fg_color=T("SURFACE"), border_color=T("BORDER"), text_color=T("TEXT"),
+                     placeholder_text="напр. 41333773", corner_radius=8).pack(side="left")
+        self._help_icon(row_peer,
+            "ID собеседника. Открой диалог на vk.com — в адресе im?sel=<peer_id>.\n"
+            "Для лички peer_id = id человека. Для беседы = 2000000000 + номер чата."
+        ).pack(side="left", padx=(8, 0))
+
+        # ── Куда положить ──
+        row_dst = ctk.CTkFrame(content, fg_color="transparent"); row_dst.pack(fill="x", pady=4)
+        ctk.CTkLabel(row_dst, text="Папка", font=self._f(12),
+                     text_color=T("TEXT"), width=110, anchor="w").pack(side="left")
+        _def_dst = self.folder_var.get().strip() or str(Path.home() / "Downloads")
+        dst_var = ctk.StringVar(value=_def_dst)
+        ctk.CTkEntry(row_dst, textvariable=dst_var, height=30, font=self._mono(11),
+                     fg_color=T("SURFACE"), border_color=T("BORDER"), text_color=T("TEXT"),
+                     corner_radius=8).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        def _browse_dst():
+            from tkinter import filedialog
+            d = filedialog.askdirectory(title="Куда сохранить выгрузку")
+            if d:
+                dst_var.set(d)
+        ctk.CTkButton(row_dst, text="…", width=36, height=30, font=self._f(13),
+                      fg_color=T("MUTED"), hover_color=T("BORDER"), text_color=T("SUB"),
+                      corner_radius=7, command=_browse_dst).pack(side="left")
+
+        pbar = ctk.CTkProgressBar(content, height=6, fg_color=T("SURFACE"),
+                                   progress_color=T("ACCENT"), corner_radius=2)
+        pbar.pack(fill="x", pady=(10, 2))
+        pbar.set(0)
+
+        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
+                                  text_color=T("TEXT"), height=150, corner_radius=8,
+                                  border_color=T("BORDER"), border_width=1)
+        log_box.pack(fill="both", expand=True, pady=(6, 8))
+        log_box.configure(state="disabled")
+
+        bf = ctk.CTkFrame(content, fg_color="transparent"); bf.pack(fill="x")
+        close_btn = ctk.CTkButton(bf, text="Закрыть", width=110, height=36,
+                                   font=self._f(12), fg_color=T("SURFACE"),
+                                   hover_color=T("BORDER"), text_color=T("SUB"),
+                                   corner_radius=8, command=close)
+        close_btn.pack(side="left")
+        go_btn = ctk.CTkButton(bf, text="Выгрузить", width=150, height=36,
+                               font=self._f(12, "bold"), fg_color=T("ACCENT"),
+                               hover_color=T("ACCENT2"), corner_radius=8)
+        go_btn.pack(side="right")
+
+        def _append(line):
+            log_box.configure(state="normal")
+            log_box.insert("end", line + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+
+        def _fetch():
+            token = tok_var.get().strip() or accounts.get(acc_var.get(), "")
+            if not token:
+                _append("Нет токена. Выбери аккаунт или вставь токен.")
+                return
+            peer_raw = peer_var.get().strip()
+            try:
+                peer = int(peer_raw)
+            except ValueError:
+                _append("peer_id должен быть числом (напр. 41333773).")
+                return
+            dst = dst_var.get().strip()
+            if not dst:
+                _append("Укажи папку назначения.")
+                return
+
+            go_btn.configure(state="disabled", text="Качаю…")
+            close_btn.configure(state="disabled")
+            pbar.configure(mode="indeterminate"); pbar.start()
+
+            def run():
+                kw = {"creationflags": 0x08000000} if IS_WIN else {}
+                export_dir = vk_script.parent / "vk_export"
+                src_json = export_dir / f"{peer}.json"
+                # ВАЖНО: один peer_id у разных аккаунтов пишется в один файл и
+                # ДОПИСЫВАЕТСЯ → диалоги смешиваются. Чистим перед выгрузкой.
+                try:
+                    if src_json.exists():
+                        src_json.unlink()
+                        self.after(0, _append, "Старый vk_export очищен (избегаем смешивания).")
+                except Exception:
+                    pass
+
+                env = os.environ.copy()
+                # Прямой доступ к VK мимо прокси (Karing и т.п.)
+                env["NO_PROXY"] = ".vk.com,.vk.ru,.userapi.com," + env.get("NO_PROXY", "")
+                ok = False
+                try:
+                    self.after(0, _append, f"Тяну диалог {peer}…")
+                    proc = subprocess.Popen(
+                        [sys.executable, str(vk_script), "--peer", str(peer), "--token", token],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, encoding="utf-8", errors="replace",
+                        cwd=str(vk_script.parent), env=env, **kw)
+                    for line in proc.stdout:
+                        line = line.rstrip()
+                        if line:
+                            self.after(0, _append, line)
+                    proc.wait()
+                    ok = (proc.returncode == 0 and src_json.exists())
+                except Exception as e:
+                    self.after(0, _append, f"Ошибка запуска: {e}")
+                    ok = False
+
+                if ok:
+                    try:
+                        import shutil
+                        target_dir = Path(dst) / f"VK_{peer}"
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_json, target_dir / f"{peer}.json")
+                        self.after(0, _append, f"Готово → {target_dir}\\{peer}.json")
+                        self.after(0, self._vk_fetch_done, str(target_dir),
+                                   bool(rem_var.get()), tok_var.get().strip(),
+                                   rem_label_var.get().strip())
+                    except Exception as e:
+                        self.after(0, _append, f"Скачано, но не скопировалось: {e}")
+                        ok = False
+
+                def finish():
+                    pbar.stop(); pbar.configure(mode="determinate")
+                    pbar.set(1.0 if ok else 0)
+                    close_btn.configure(state="normal")
+                    if ok:
+                        go_btn.configure(text="✓ Готово", fg_color=T("GREEN"), state="disabled")
+                    else:
+                        go_btn.configure(text="Повторить", state="normal")
+                self.after(0, finish)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        go_btn.configure(command=_fetch)
+
+    def _vk_fetch_done(self, folder: str, remember: bool, token: str, label: str):
+        """После успешной выгрузки: ставим папку источником + (опц.) сохраняем токен."""
+        self.folder_var.set(folder)
+        self.flbl.configure(text=folder, text_color=T("TEXT"))
+        self._add_recent(folder)
+        if remember and token:
+            toks = dict(self._cfg.get("vk_tokens") or {})
+            toks[label or "Сохранённый"] = token
+            self._cfg["vk_tokens"] = toks
+        self._save_cfg()
 
     def _show_install_dialog(self):
         has_nv = _has_nvidia()
         size_str = "~2.5 ГБ (NVIDIA CUDA)" if has_nv else "~300 МБ (CPU)"
 
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Установка Whisper")
-        dlg.resizable(False, False)
-        dlg.geometry("520x450")
-        dlg.grab_set()
-        dlg.focus_set()
+        overlay, content, close = self._overlay(
+            "Установка Whisper", width=560, height=480)
 
-        ctk.CTkLabel(dlg, text="Поддержка расшифровки голосовых",
-                     font=self._f(15, "bold"), text_color=T("TEXT")).pack(pady=(20, 4), padx=20)
-        ctk.CTkLabel(dlg,
+        ctk.CTkLabel(content,
                      text=f"Будет установлено: Whisper + PyTorch  ({size_str})\n"
                           "Нужен интернет. После установки перезапуск не нужен.",
-                     font=self._f(11), text_color=T("SUB"), justify="center").pack(padx=20, pady=(0, 12))
+                     font=self._f(11), text_color=T("SUB"),
+                     justify="center").pack(pady=(2, 10))
 
-        pbar = ctk.CTkProgressBar(dlg, height=6, fg_color=T("SURFACE"),
+        pbar = ctk.CTkProgressBar(content, height=6, fg_color=T("SURFACE"),
                                    progress_color=T("ACCENT"), corner_radius=2)
-        pbar.pack(fill="x", padx=20, pady=(4, 2))
+        pbar.pack(fill="x", pady=(4, 2))
         pbar.set(0)
-        plbl = ctk.CTkLabel(dlg, text="", font=self._f(10), text_color=T("SUB"))
-        plbl.pack(anchor="w", padx=22)
+        plbl = ctk.CTkLabel(content, text="", font=self._f(10), text_color=T("SUB"))
+        plbl.pack(anchor="w")
 
-        log_box = ctk.CTkTextbox(dlg, font=self._mono(11), fg_color=T("SURFACE"),
-                                  text_color=T("TEXT"), height=190, corner_radius=8,
+        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
+                                  text_color=T("TEXT"), height=200, corner_radius=8,
                                   border_color=T("BORDER"), border_width=1)
-        log_box.pack(fill="x", padx=20, pady=(8, 8))
+        log_box.pack(fill="both", expand=True, pady=(8, 8))
         log_box.configure(state="disabled")
 
-        bf = ctk.CTkFrame(dlg, fg_color="transparent")
-        bf.pack(fill="x", padx=20, pady=(0, 16))
+        bf = ctk.CTkFrame(content, fg_color="transparent")
+        bf.pack(fill="x")
 
         close_btn = ctk.CTkButton(bf, text="Закрыть", width=110, height=36,
                                    font=self._f(12), fg_color=T("SURFACE"),
                                    hover_color=T("BORDER"), text_color=T("SUB"),
-                                   corner_radius=8, state="disabled", command=dlg.destroy)
+                                   corner_radius=8, state="disabled", command=close)
         close_btn.pack(side="left")
 
         install_btn = ctk.CTkButton(bf, text="Установить", width=140, height=36,
@@ -1053,7 +1664,9 @@ class App(_BaseApp):
                 pbar.set(1.0)
                 plbl.configure(text="Готово! Голосовые будут расшифровываться при следующем запуске.")
                 install_btn.configure(text="✓ Установлено", fg_color=T("GREEN"), state="disabled")
+                self._whisper_installed = True
                 self._whisper_banner.pack_forget()
+                self._update_model_status()
             else:
                 pbar.set(0)
                 plbl.configure(text="Ошибка. Проверьте лог выше.")
@@ -1068,34 +1681,227 @@ class App(_BaseApp):
             def run():
                 kw = {"creationflags": 0x08000000} if IS_WIN else {}
 
+                target = str(LOCAL_PKGS)
+                base_args = ["--target", target, "--upgrade"]
+
                 def run_pip(args, label):
-                    dlg.after(0, plbl.configure, {"text": label})
+                    self.after(0, plbl.configure, {"text": label})
                     proc = subprocess.Popen(
-                        [sys.executable, "-m", "pip", "install"] + args,
+                        [sys.executable, "-m", "pip", "install"] + base_args + args,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         text=True, **kw)
                     for line in proc.stdout:
                         line = line.rstrip()
                         if line:
-                            dlg.after(0, _append, line)
+                            self.after(0, _append, line)
                             if len(line) < 80:
-                                dlg.after(0, plbl.configure, {"text": line})
+                                self.after(0, plbl.configure, {"text": line})
                     proc.wait()
                     return proc.returncode
 
-                r1 = run_pip(["openai-whisper"], "Скачивание Whisper...")
-                if has_nv:
-                    r2 = run_pip(["torch", "--index-url",
-                                  "https://download.pytorch.org/whl/cu124"],
-                                 "Скачивание PyTorch CUDA (~2.5 ГБ)...")
-                else:
-                    r2 = run_pip(["torch"], "Скачивание PyTorch CPU (~300 МБ)...")
+                self.after(0, _append, f"Папка установки: {target}")
 
-                dlg.after(0, on_done, r1 == 0 and r2 == 0)
+                env = os.environ.copy()
+                env["PYTHONPATH"] = target + os.pathsep + env.get("PYTHONPATH", "")
+                cuda_ok = False
+                if has_nv and (LOCAL_PKGS / "torch").is_dir():
+                    try:
+                        check = subprocess.run(
+                            [sys.executable, "-c",
+                             "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"],
+                            capture_output=True, env=env, **kw)
+                        cuda_ok = (check.returncode == 0)
+                    except Exception:
+                        cuda_ok = False
+
+                # ВАЖНО: для NVIDIA-машин ставим whisper ПЕРВЫМ, потом CUDA-torch с
+                # --force-reinstall. Иначе whisper тянет torch из PyPI (CPU-only)
+                # и перезаписывает уже установленный CUDA-torch → расшифровка идёт на CPU.
+                if has_nv:
+                    r2 = run_pip(["openai-whisper"], "Скачивание Whisper...")
+                    if cuda_ok and r2 == 0:
+                        # Проверим, что whisper не сбил CUDA-torch
+                        try:
+                            check2 = subprocess.run(
+                                [sys.executable, "-c",
+                                 "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"],
+                                capture_output=True, env=env, **kw)
+                            cuda_ok = (check2.returncode == 0)
+                        except Exception:
+                            cuda_ok = False
+                    if cuda_ok:
+                        self.after(0, _append, "torch CUDA уже установлен — пропускаем")
+                        r1 = 0
+                    else:
+                        r1 = run_pip(["torch", "--index-url",
+                                      "https://download.pytorch.org/whl/cu124",
+                                      "--force-reinstall"],
+                                     "Скачивание PyTorch CUDA (~2.5 ГБ)...")
+                else:
+                    r1 = run_pip(["torch"], "Скачивание PyTorch CPU (~300 МБ)...")
+                    r2 = run_pip(["openai-whisper"], "Скачивание Whisper...")
+
+                self.after(0, on_done, r1 == 0 and r2 == 0)
 
             threading.Thread(target=run, daemon=True).start()
 
         install_btn.configure(command=do_install)
+
+    def _show_whisper_uninstall_dialog(self):
+        overlay, content, close = self._overlay(
+            "Удаление Whisper", width=560, height=440)
+
+        ctk.CTkLabel(content,
+                     text="Будут удалены: пакеты openai-whisper + torch, скачанные\n"
+                          "модели и старый общий кэш ~/.cache/whisper (до ~5 ГБ освободится).\n"
+                          "После удаления голосовые перестанут расшифровываться.\n"
+                          "Установить обратно можно через это же окно «О программе».",
+                     font=self._f(11), text_color=T("SUB"),
+                     justify="center").pack(pady=(2, 10))
+
+        pbar = ctk.CTkProgressBar(content, height=6, fg_color=T("SURFACE"),
+                                   progress_color=T("ACCENT"), corner_radius=2)
+        pbar.pack(fill="x", pady=(4, 2))
+        pbar.set(0)
+        plbl = ctk.CTkLabel(content, text="", font=self._f(10), text_color=T("SUB"))
+        plbl.pack(anchor="w")
+
+        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
+                                  text_color=T("TEXT"), height=180, corner_radius=8,
+                                  border_color=T("BORDER"), border_width=1)
+        log_box.pack(fill="both", expand=True, pady=(8, 8))
+        log_box.configure(state="disabled")
+
+        bf = ctk.CTkFrame(content, fg_color="transparent")
+        bf.pack(fill="x")
+
+        close_btn = ctk.CTkButton(bf, text="Закрыть", width=110, height=36,
+                                   font=self._f(12), fg_color=T("SURFACE"),
+                                   hover_color=T("BORDER"), text_color=T("SUB"),
+                                   corner_radius=8, command=close)
+        close_btn.pack(side="left")
+
+        uninstall_btn = ctk.CTkButton(bf, text="Удалить", width=140, height=36,
+                                       font=self._f(12, "bold"), fg_color="#AA3333",
+                                       hover_color="#882828", corner_radius=8)
+        uninstall_btn.pack(side="right")
+
+        def _append(line):
+            log_box.configure(state="normal")
+            log_box.insert("end", line + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+
+        def on_done(success):
+            pbar.stop()
+            pbar.configure(mode="determinate")
+            if success:
+                pbar.set(1.0)
+                plbl.configure(text="Готово. Перезапустите программу, чтобы освободить память.")
+                uninstall_btn.configure(text="✓ Удалено", fg_color=T("MUTED"), state="disabled")
+                self._whisper_installed = False
+                self._whisper_banner.pack(fill="x", pady=(0, 8),
+                                          before=self._whisper_banner_anchor)
+                self._update_model_status()
+            else:
+                pbar.set(0)
+                plbl.configure(text="Ошибка. Проверьте лог выше.")
+                uninstall_btn.configure(text="Повторить", state="normal", command=do_uninstall)
+
+        def do_uninstall():
+            uninstall_btn.configure(state="disabled", text="Удаление...")
+            pbar.configure(mode="indeterminate")
+            pbar.start()
+
+            def run():
+                import shutil as _sh
+                plbl_after = lambda t: self.after(0, plbl.configure, {"text": t})
+                ok = True
+                # Три цели: пакеты whisper/torch (local_packages), скачанные
+                # модели (whisper_models) и старый общий кэш ~/.cache/whisper.
+                # recreate=True — папку оставляем пустой (прога её ждёт).
+                targets = [
+                    (LOCAL_PKGS,           "пакеты whisper + torch",            True),
+                    (WHISPER_MODELS,       "скачанные модели",                  False),
+                    (WHISPER_CACHE_LEGACY, "старый общий кэш ~/.cache/whisper", False),
+                ]
+                for path, label, recreate in targets:
+                    plbl_after(f"Удаление: {label} ...")
+                    self.after(0, _append, f"rmtree: {path}")
+                    try:
+                        if path.exists():
+                            _sh.rmtree(path, ignore_errors=False)
+                            self.after(0, _append, f"✓ удалено: {label}")
+                        else:
+                            self.after(0, _append, f"— нечего удалять: {label}")
+                        if recreate:
+                            path.mkdir(parents=True, exist_ok=True)
+                    except Exception as e:
+                        self.after(0, _append, f"Ошибка ({label}): {e}")
+                        ok = False
+                self.after(0, on_done, ok)
+
+            threading.Thread(target=run, daemon=True).start()
+
+        uninstall_btn.configure(command=do_uninstall)
+
+    def _apply_preset(self, key: str):
+        """Накатить набор настроек: dialog | forum | channel."""
+        presets = {
+            "dialog":  {"fmt_md": False, "show_ts": True,  "show_src": False, "split_mode": "none"},
+            "forum":   {"fmt_md": False, "show_ts": True,  "show_src": True,  "split_mode": "none"},
+            "channel": {"fmt_md": True,  "show_ts": True,  "show_src": True,  "split_mode": "month"},
+        }
+        p = presets.get(key)
+        if not p:
+            return
+        self.fmt_md     = p["fmt_md"]
+        self.show_ts    = p["show_ts"]
+        self.show_src   = p["show_src"]
+        self.split_mode = p["split_mode"]
+        # Перерисовать кнопки. Используем функции toggle, но они инвертируют —
+        # выставляем точно нужное состояние через прямые configure.
+        if self.fmt_md:
+            self._fmt_btn.configure(text="📝 MD", fg_color=T("ACCENT"), text_color="white")
+        else:
+            self._fmt_btn.configure(text="📄 TXT", fg_color=T("MUTED"), text_color=T("SUB"))
+        if self.show_ts:
+            self._ts_btn.configure(text="🕐 [HH:MM]", fg_color=T("ACCENT"),
+                                   border_color=T("ACCENT"), text_color="white")
+        else:
+            self._ts_btn.configure(text="🕐 без времени", fg_color=T("SURFACE"),
+                                   border_color=T("BORDER"), text_color=T("SUB"))
+        if self.show_src:
+            self._src_btn.configure(text="🏷 [TG]", fg_color=T("ACCENT"),
+                                    border_color=T("ACCENT"), text_color="white")
+        else:
+            self._src_btn.configure(text="🏷 без меток", fg_color=T("SURFACE"),
+                                    border_color=T("BORDER"), text_color=T("SUB"))
+        txt, fg, bc, tc = self._split_labels()[self.split_mode]
+        self._split_btn.configure(text=txt, fg_color=fg, border_color=bc, text_color=tc)
+        self._save_cfg()
+        self._highlight_preset(key)
+        self.plbl.configure(text=f"✓ Пресет применён: {key}")
+        self.after(2500, lambda: self.plbl.configure(text=""))
+
+    def _highlight_preset(self, key: str | None):
+        """Подсветить активный пресет, остальные — обычные."""
+        self._active_preset = key
+        if not hasattr(self, "_preset_btns"):
+            return
+        for k, btn in self._preset_btns.items():
+            if k == key:
+                btn.configure(fg_color=T("ACCENT"), text_color="white",
+                              border_color=T("ACCENT"))
+            else:
+                btn.configure(fg_color=T("SURFACE"), text_color=T("SUB"),
+                              border_color=T("BORDER"))
+
+    def _clear_preset_highlight(self):
+        """Снять подсветку — вызывается при ручном изменении любой настройки,
+        входящей в состав пресета (формат/время/источник/разбивка)."""
+        if getattr(self, "_active_preset", None) is not None:
+            self._highlight_preset(None)
 
     def _toggle_merge(self):
         self.merge_on = not self.merge_on
@@ -1111,49 +1917,178 @@ class App(_BaseApp):
 
     def _copy_log(self):
         text = self.log.get("1.0", "end").strip()
-        if text:
+        if not text:
+            return
+        # Tk-буфер обмена работает только пока окно открыто и очищается при
+        # выходе из приложения — вставка «после закрытия проги» давала пустоту.
+        try:
             self.clipboard_clear()
             self.clipboard_append(text)
-            self.plbl.configure(text="✓ Лог скопирован в буфер")
-            self.after(2000, lambda: self.plbl.configure(text=""))
+            self.update_idletasks()
+        except Exception:
+            pass
+        # Windows: дублируем в системный буфер через Set-Clipboard — он
+        # переживает закрытие приложения. Текст передаём через временный
+        # UTF-8 файл: stdin/clip.exe ломают кириллицу, файл — нет.
+        if IS_WIN:
+            try:
+                import tempfile
+                fd, p = tempfile.mkstemp(suffix=".txt")
+                os.close(fd)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(text)
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f'$t=[IO.File]::ReadAllText("{p}",[Text.Encoding]::UTF8);'
+                     f'Set-Clipboard -Value $t'],
+                    check=False, creationflags=0x08000000)
+                os.remove(p)
+            except Exception:
+                pass
+        self.plbl.configure(text="✓ Лог скопирован в буфер")
+        self.after(2000, lambda: self.plbl.configure(text=""))
 
     def _cancel(self):
-        _cancel_event.set()
-        self._log("--- Отмена: текущий файл будет пропущен... ---")
-        self.cbtn.configure(state="disabled", text="⏳ Отмена...")
+        # Двухэтапная отмена:
+        # 1-й клик — мягкая (флаг, ждём окончания текущего голосового — Whisper нельзя
+        #            прервать в середине одного файла, он не отдаёт control).
+        # 2-й клик — жёсткая (os._exit) — на случай если файл длинный или Whisper завис.
+        if not _cancel_event.is_set():
+            _cancel_event.set()
+            self._log("--- Отмена: текущий файл будет дораспознан, дальше пропуск... ---")
+            self._log("    (нажми «Отмена» ещё раз — жёсткий выход без сохранения)")
+            self.cbtn.configure(text="Прервать сейчас", fg_color="#AA3333",
+                                 hover_color="#882828")
+        else:
+            self._log("--- Жёсткий выход ---")
+            os._exit(0)
+
+    def _show_help(self):
+        """Большая справка по всем фичам — оверлей со скроллом."""
+        overlay, content, close = self._overlay(
+            "Справка", width=640, height=560)
+
+        scroll = ctk.CTkScrollableFrame(content, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, pady=(0, 8))
+
+        sections = [
+            ("🚀  Быстрый старт",
+             "1. Перетащи папку с перепиской в окно (или «Выбрать…»).\n"
+             "2. Введи своё имя как в мессенджере.\n"
+             "3. Жми «▶ Запустить». Готовый файл появится рядом с папкой."),
+            ("📁  Откуда брать переписки",
+             "Telegram → Настройки → Экспорт данных, формат JSON. Скармливай папку чата (с result.json).\n"
+             "ВКонтакте (HTML) → vk.com/data_protection → запросить, распаковать. Внутри messages/<ID>/ — нужный диалог.\n"
+             "ВКонтакте (быстро, через API) → tools/vk_fetch_history.py: сначала --list (узнать peer_id),\n"
+             "   потом --peer <id>. Папку tools/vk_export/ скармливай как обычно.\n"
+             "Instagram → instagram.com/accounts/your_data → формат JSON, распаковать.\n"
+             "WhatsApp → в чате ⋮ → Ещё → Экспорт чата (С медиа). Распаковать ZIP."),
+            ("🎙  Расшифровка голосовых",
+             "Whisper работает офлайн, без облаков. Один раз поставь через жёлтый банннер.\n"
+             "На NVIDIA — автоматически встанет CUDA-версия (быстрая).\n"
+             "Кэш расшифровок сохраняется рядом — повторный запуск пропускает уже сделанные файлы."),
+            ("🏷  Метки источников",
+             "Если в одной папке несколько мессенджеров (TG+VK+IG+WA одного контакта), включи 🏷 [TG] —\n"
+             "будет видно, откуда каждое сообщение."),
+            ("🔍  Фильтры",
+             "ОТ: оставить только сообщения от автора (по подстроке имени).\n"
+             "СОДЕРЖИТ: regex по тексту. Примеры: «работ|деньг», «^привет», «https?://»."),
+            ("📅  Период и разбивка",
+             "Период: календарь, два клика — начало/конец.\n"
+             "Разбивка: один файл / по месяцам / по годам — для длинных переписок."),
+            ("⌨  Хоткеи",
+             "Esc — закрыть текущий оверлей.\n"
+             "Drag & Drop папки/файла — в любое место окна.")
+        ]
+
+        for title, body in sections:
+            ctk.CTkLabel(scroll, text=title,
+                         font=self._f(13, "bold"), text_color=T("ACCENT"),
+                         anchor="w").pack(fill="x", pady=(8, 2))
+            ctk.CTkLabel(scroll, text=body,
+                         font=self._f(11), text_color=T("TEXT"),
+                         justify="left", anchor="w",
+                         wraplength=580).pack(fill="x", padx=4)
+
+        ctk.CTkLabel(scroll,
+                     text=f"Версия {VERSION} · {GITHUB}",
+                     font=self._f(10), text_color=T("SUB")).pack(pady=(16, 0))
+
+        ctk.CTkButton(content, text="Закрыть", width=130, height=36,
+                      font=self._f(12), fg_color=T("MUTED"),
+                      hover_color=T("BORDER"), text_color=T("SUB"),
+                      corner_radius=8, command=close).pack(side="bottom")
 
     def _show_about(self):
-        win = ctk.CTkToplevel(self)
-        win.title("О программе"); win.resizable(False, False)
-        win.configure(fg_color=T("SURFACE")); win.grab_set()
-        win.after(60, win.lift)
-        ctk.CTkLabel(win, text="💬", font=self._f(52)).pack(pady=(28, 0))
-        ctk.CTkLabel(win, text="Merge Chat",
-                     font=self._f(24, "bold"), text_color=T("TEXT")).pack(pady=(6, 2))
-        ctk.CTkLabel(win, text=f"Версия {VERSION}",
+        # backdrop=False — не затемняем всё окно (главный UI виден вокруг карточки).
+        # height=470 подогнана под реальный объём контента (~430px): раньше было 520
+        # и внутри карточки висела пустая распорка.
+        overlay, content, close = self._overlay(
+            "О программе", width=460, height=470, backdrop=False)
+
+        ctk.CTkLabel(content, text="💬", font=self._f(46)).pack(pady=(0, 0))
+        ctk.CTkLabel(content, text="Merge Chat",
+                     font=self._f(22, "bold"), text_color=T("TEXT")).pack(pady=(4, 0))
+        ctk.CTkLabel(content, text=f"Версия {VERSION}",
                      font=self._f(12), text_color=T("SUB")).pack()
-        ctk.CTkFrame(win, fg_color=T("BORDER"), height=1).pack(fill="x", padx=40, pady=16)
-        ctk.CTkLabel(win, text="Автор", font=self._f(11), text_color=T("SUB")).pack()
-        ctk.CTkLabel(win, text=AUTHOR, font=self._f(17, "bold"),
+
+        ctk.CTkFrame(content, fg_color=T("BORDER"), height=1).pack(fill="x", pady=14)
+
+        ctk.CTkLabel(content, text="Автор", font=self._f(11), text_color=T("SUB")).pack()
+        ctk.CTkLabel(content, text=AUTHOR, font=self._f(15, "bold"),
                      text_color=T("TEXT")).pack(pady=(2, 0))
-        ctk.CTkLabel(win, text=GITHUB, font=self._f(11),
-                     text_color=T("ACCENT")).pack(pady=(2, 0))
-        ctk.CTkFrame(win, fg_color=T("BORDER"), height=1).pack(fill="x", padx=40, pady=16)
-        ctk.CTkLabel(win, text="Объединяет переписки Telegram, ВКонтакте,\n"
-                               "Instagram и WhatsApp в один файл.\n"
-                               "Расшифровывает голосовые через Whisper\n"
-                               "офлайн, без облаков.",
-                     font=self._f(12), text_color=T("SUB"), justify="center").pack(padx=36)
+        gh_url = GITHUB if GITHUB.startswith("http") else f"https://{GITHUB}"
+        gh_lbl = ctk.CTkLabel(content, text=GITHUB, font=self._f(11, "bold"),
+                              text_color=T("ACCENT"), cursor="hand2")
+        gh_lbl.pack(pady=(2, 0))
+        def _open_gh(_e=None):
+            try:
+                import webbrowser
+                webbrowser.open(gh_url)
+            except Exception:
+                pass
+        gh_lbl.bind("<Button-1>", _open_gh)
+        # Подчёркивание ссылки — через отдельную тонкую полоску под текстом неудобно;
+        # ограничимся курсором hand2 и акцентным цветом.
+
+        ctk.CTkFrame(content, fg_color=T("BORDER"), height=1).pack(fill="x", pady=14)
+
+        ctk.CTkLabel(content,
+                     text="Объединяет переписки Telegram, ВКонтакте,\n"
+                          "Instagram и WhatsApp в один файл.\n"
+                          "Расшифровывает голосовые через Whisper офлайн.",
+                     font=self._f(11), text_color=T("SUB"),
+                     justify="center").pack()
+
         dnd_s = "✓ Drag & Drop активен" if _HAS_DND else "○ DnD: pip install tkinterdnd2"
-        ctk.CTkLabel(win, text=dnd_s, font=self._f(10),
+        ctk.CTkLabel(content, text=dnd_s, font=self._f(10),
                      text_color=T("GREEN") if _HAS_DND else T("SUB")).pack(pady=(8, 0))
-        ctk.CTkButton(win, text="Закрыть", width=130, height=36, font=self._f(13),
+
+        wrow = ctk.CTkFrame(content, fg_color="transparent")
+        wrow.pack(pady=(10, 0))
+        if self._whisper_installed:
+            ctk.CTkLabel(wrow, text="✓ Whisper установлен", font=self._f(11),
+                         text_color=T("GREEN")).pack(side="left", padx=(0, 10))
+            ctk.CTkButton(wrow, text="Удалить", width=100, height=28, font=self._f(11),
+                          fg_color=T("MUTED"), hover_color="#AA3333",
+                          text_color=T("SUB"), corner_radius=6,
+                          command=lambda: (close(), self._show_whisper_uninstall_dialog())
+                          ).pack(side="left")
+        else:
+            ctk.CTkLabel(wrow, text="○ Whisper не установлен", font=self._f(11),
+                         text_color=T("SUB")).pack(side="left", padx=(0, 10))
+            ctk.CTkButton(wrow, text="Установить", width=100, height=28, font=self._f(11),
+                          fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
+                          text_color="white", corner_radius=6,
+                          command=lambda: (close(), self._show_install_dialog())
+                          ).pack(side="left")
+
+        # Распорка чтобы кнопка «Закрыть» прижалась к низу карточки
+        ctk.CTkFrame(content, fg_color="transparent").pack(fill="both", expand=True)
+        ctk.CTkButton(content, text="Закрыть", width=130, height=36, font=self._f(12),
                       fg_color=T("MUTED"), hover_color=T("BORDER"),
-                      command=win.destroy).pack(pady=24)
-        win.update_idletasks()
-        ww = max(340, win.winfo_reqwidth() + 60); wh = win.winfo_reqheight() + 24
-        win.geometry(f"{ww}x{wh}+{self.winfo_x()+(self.winfo_width()-ww)//2}+"
-                     f"{self.winfo_y()+(self.winfo_height()-wh)//2}")
+                      text_color=T("SUB"), corner_radius=8,
+                      command=close).pack(side="bottom", pady=(8, 0))
 
     def _log(self, msg):
         if IS_WIN:
@@ -1166,20 +2101,50 @@ class App(_BaseApp):
     def _clear_log(self):
         self.log.delete("1.0", "end")
 
+    def _toggle_auto_open(self):
+        self.auto_open = self._auto_open_var.get()
+        self._save_cfg()
+
     def _open_output(self):
-        _cnw = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW
+        # Explorer/open запускаем БЕЗ creationflags — CREATE_NO_WINDOW мешал
+        # запуску GUI-процесса explorer.exe (окно не появлялось).
+        target_file = None
+        target_dir = None
         if self.output_path and Path(self.output_path).exists():
-            if IS_WIN:
-                subprocess.Popen(["explorer", "/select,", str(Path(self.output_path))], creationflags=_cnw)
-            elif IS_MAC:
-                subprocess.Popen(["open", "-R", str(Path(self.output_path))])
+            target_file = Path(self.output_path)
+            target_dir = target_file.parent
         else:
             folder = self.folder_var.get()
             if folder and Path(folder).exists():
+                p = Path(folder)
+                target_dir = p if p.is_dir() else p.parent
+
+        if target_dir is None:
+            self._log("[!] Нечего открывать: нет ни выходного файла, ни исходной папки.")
+            return
+
+        try:
+            if IS_WIN:
+                if target_file is not None:
+                    # /select, требует абсолютного пути с обратными слэшами
+                    subprocess.Popen(
+                        f'explorer /select,"{target_file}"', shell=False)
+                else:
+                    os.startfile(str(target_dir))
+            elif IS_MAC:
+                if target_file is not None:
+                    subprocess.Popen(["open", "-R", str(target_file)])
+                else:
+                    subprocess.Popen(["open", str(target_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(target_dir)])
+        except Exception as ex:
+            self._log(f"[!] Не удалось открыть проводник: {ex}")
+            try:
                 if IS_WIN:
-                    subprocess.Popen(["explorer", str(Path(folder))], creationflags=_cnw)
-                elif IS_MAC:
-                    subprocess.Popen(["open", str(Path(folder))])
+                    os.startfile(str(target_dir))
+            except Exception:
+                pass
 
     def _run(self):
         if self.running: return
@@ -1202,7 +2167,7 @@ class App(_BaseApp):
                              fg_color=T("MUTED"), text_color=T("SUB"))
         self.obtn.configure(state="disabled", fg_color=T("MUTED"), text_color=T("SUB"))
         self.cbtn.pack(in_=self._bf, side="right", padx=(0, 8))
-        self.cbtn.configure(state="normal", text="✕  Отмена")
+        self.cbtn.configure(state="normal", text="Отмена")
         self.pbar.set(0); self.plbl.configure(text="")
         self._clear_log(); self._log("Запуск…")
 
@@ -1263,6 +2228,40 @@ class App(_BaseApp):
                                 break
                     self.after(0, self._log, line)
 
+                # Автодетект режима: аудио-файл / папка с аудио / переписка
+                _src = Path(folder)
+                _audio_exts = getattr(_mc, "AUDIO_EXTS",
+                    {".mp3",".wav",".m4a",".ogg",".oga",".opus",
+                     ".aac",".flac",".webm",".amr",".mp4"})
+                _is_audio = False
+                if _src.is_file() and _src.suffix.lower() in _audio_exts:
+                    _is_audio = True
+                elif _src.is_dir():
+                    _has_chat = any(
+                        list(_src.rglob(p))[:1]
+                        for p in ("result.json", "messages*.html", "_chat.txt", "*.txt", "*.json")
+                    )
+                    _has_audio = any(
+                        p for p in _src.rglob("*")
+                        if p.is_file() and p.suffix.lower() in _audio_exts
+                    )
+                    if _has_audio and not _has_chat:
+                        _is_audio = True
+
+                if _is_audio:
+                    self.after(0, self._log, "[Режим] Аудио — только транскрипция.")
+                    out = _mc.process_audio(
+                        source_path=folder,
+                        model=self.model_var.get(),
+                        output_format=fmt,
+                        show_timestamps=self.show_ts,
+                        log_cb=log_cb,
+                        progress_cb=lambda p: self.after(0, self.pbar.set, min(float(p), 1.0)),
+                    )
+                    cancelled = _cancel_event.is_set()
+                    self.after(0, self._done, bool(out), cancelled)
+                    return
+
                 out = _mc.process_folder(
                     folder_path=folder,
                     author=self.author_var.get() or "Вы",
@@ -1275,6 +2274,15 @@ class App(_BaseApp):
                     date_to=self.date_to.get().strip(),
                     show_timestamps=self.show_ts,
                     split_mode=self.split_mode,
+                    show_source=self.show_src,
+                    filter_author=self.filter_author.get().strip(),
+                    filter_text=self.filter_text.get().strip(),
+                    my_display=(self.my_display_var.get().strip()
+                                if getattr(self, "_adv_names_var", None) and self._adv_names_var.get()
+                                else (self.author_var.get().strip().split(",")[0].strip() or "Я")),
+                    peer_display=(self.peer_display_var.get().strip()
+                                  if getattr(self, "_adv_names_var", None) and self._adv_names_var.get()
+                                  else ""),
                 )
                 cancelled = _cancel_event.is_set()
                 self.after(0, self._done, bool(out), cancelled)
@@ -1297,17 +2305,21 @@ class App(_BaseApp):
             self.obtn.configure(state="normal", fg_color=T("MUTED"),
                                 hover_color=T("BORDER"), text_color=T("SUB"))
         if cancelled:
-            self.rbtn.configure(text="▶  Запустить", state="normal",
+            self.rbtn.configure(text="Запустить", state="normal",
                                  fg_color=T("ACCENT"), text_color=T("TEXT"))
             self._log("\n[X] Обработка отменена.")
             if self.output_path and Path(self.output_path).exists():
                 self._log("[OK] Частичный файл сохранён — нажми «Открыть папку».")
         elif ok and self.output_path:
-            self.rbtn.configure(text="▶  Запустить снова", state="normal",
+            self.rbtn.configure(text="Запустить снова", state="normal",
                                  fg_color=T("ACCENT"), text_color=T("TEXT"))
-            self._log("\n[OK] Готово! Нажми «Открыть папку».")
+            if self.auto_open:
+                self._log("\n[OK] Готово! Открываю папку (галка «сразу» включена).")
+                self._open_output()
+            else:
+                self._log("\n[OK] Готово! Нажми «Открыть папку».")
         else:
-            self.rbtn.configure(text="▶  Запустить", state="normal",
+            self.rbtn.configure(text="Запустить", state="normal",
                                  fg_color=T("ACCENT"), text_color=T("TEXT"))
             self._log("\n[X] Завершено с ошибкой.")
 

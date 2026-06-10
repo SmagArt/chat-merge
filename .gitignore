@@ -16,3 +16,9 @@ build_log.txt
 *.flag
 install_log.txt
 launch_log.txt
+
+# VK API-выгрузка (tools/vk_fetch_history.py) — секреты и личные данные
+tools/.env
+tools/vk_export/
+# Личная шпаргалка с peer_id/именами — только локально
+ВЫГРУЗКА_ВК_прочитай_утром.md

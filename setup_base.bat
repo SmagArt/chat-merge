@@ -44,5 +44,10 @@ echo %DATE% %TIME% base packages exit=%ERRORLEVEL% >> "%LOGFILE%"
 REM Verify customtkinter importable
 "!PY!" -c "import customtkinter; print('customtkinter OK')" >> "%LOGFILE%" 2>&1
 echo %DATE% %TIME% ctk check exit=%ERRORLEVEL% >> "%LOGFILE%"
+
+REM Precompile .pyc for faster cold start
+"!PY!" -m compileall -q "%APPDIR%merge_chat.py" "%APPDIR%merge_chat_gui.py" >> "%LOGFILE%" 2>&1
+echo %DATE% %TIME% compileall exit=!ERRORLEVEL! >> "%LOGFILE%"
+
 echo %DATE% %TIME% DONE >> "%LOGFILE%"
 exit /b 0

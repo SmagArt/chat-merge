@@ -88,9 +88,14 @@ def _log_error(msg: str):
     try: _logging.error(msg)
     except Exception: pass
 
-# ffmpeg: используем imageio-ffmpeg если системного нет
+# ffmpeg: используем imageio-ffmpeg если системного нет.
+# Whisper (whisper.audio.load_audio) вызывает голый бинарь "ffmpeg" через subprocess —
+# то есть ему нужен исполняемый файл с именем ИМЕННО ffmpeg(.exe) в PATH.
+# imageio-ffmpeg качает бинарь под именем типа ffmpeg-win-x86_64-v7.1.exe,
+# поэтому просто добавить его директорию в PATH недостаточно — Whisper не найдёт.
+# Решение: положить копию бинарника под именем ffmpeg.exe в TEMP и подставить эту папку в PATH.
 def _fix_ffmpeg():
-    import shutil as _sh, os as _os2
+    import shutil as _sh, os as _os2, sys as _sysf
     if _sh.which("ffmpeg"):
         return
     try:
@@ -99,18 +104,28 @@ def _fix_ffmpeg():
         exe = _iff.get_ffmpeg_exe()
         if not exe or not _P(exe).exists():
             return
-        _dir = str(_P(exe).parent)
-        _os2.environ["PATH"] = _dir + _os2.pathsep + _os2.environ.get("PATH", "")
         import tempfile as _tmp
-        _tlink = _P(_tmp.gettempdir()) / "ffmpeg"
-        if not _tlink.exists():
-            try:
-                _tlink.symlink_to(exe)
-            except Exception:
-                pass
-        _tdir = str(_tlink.parent)
-        if _tdir not in _os2.environ.get("PATH",""):
-            _os2.environ["PATH"] = _tdir + _os2.pathsep + _os2.environ.get("PATH", "")
+        target_name = "ffmpeg.exe" if _sysf.platform == "win32" else "ffmpeg"
+        target_dir = _P(_tmp.gettempdir()) / "merge_chat_ffmpeg"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / target_name
+        # Копия (быстрее симлинка и не требует прав администратора на Windows).
+        # Переcкопировать если бинарь обновился.
+        try:
+            need_copy = (not target.exists() or
+                         target.stat().st_size != _P(exe).stat().st_size)
+            if need_copy:
+                _sh.copy2(exe, target)
+        except Exception:
+            pass
+        # PATH: и оригинальная директория (на всякий случай), и наша с правильным именем.
+        _src_dir = str(_P(exe).parent)
+        _dst_dir = str(target_dir)
+        cur_path = _os2.environ.get("PATH", "")
+        for d in (_dst_dir, _src_dir):
+            if d not in cur_path:
+                cur_path = d + _os2.pathsep + cur_path
+        _os2.environ["PATH"] = cur_path
     except Exception:
         pass
 
@@ -154,6 +169,27 @@ VK_ATTACHMENT_LABELS = {
     "статья":              "[📝 Статья]",
 }
 
+# Типы вложений из VK API (tools/vk_fetch_history.py → vk_export JSON).
+# Отличается от HTML-меток выше: там русские подписи, тут англ. type из API.
+VK_JSON_ATTACH = {
+    "photo":         "[📷 Фото]",
+    "video":         "[🎬 Видео]",
+    "audio":         "[🎵 Аудио]",
+    "audio_message": "[🎤 Голосовое — файл недоступен в выгрузке через API]",
+    "doc":           "[📄 Документ]",
+    "sticker":       "[Стикер]",
+    "link":          "[🔗 Ссылка]",
+    "wall":          "[📌 Запись со стены]",
+    "wall_reply":    "[💬 Комментарий к записи]",
+    "market":        "[🛒 Товар]",
+    "market_album":  "[🛒 Товары]",
+    "poll":          "[📊 Опрос]",
+    "gift":          "[🎁 Подарок]",
+    "graffiti":      "[Граффити]",
+    "story":         "[Story]",
+    "call":          "[📞 Звонок]",
+}
+
 
 # ── Pre-import для PyInstaller (замороженный режим) ──────
 # В frozen сборке _MEIPASS нужно добавить в sys.path до импорта whisper
@@ -161,12 +197,34 @@ import sys as _sys_pre
 _meipass_pre = getattr(_sys_pre, '_MEIPASS', None)
 if _meipass_pre and _meipass_pre not in _sys_pre.path:
     _sys_pre.path.insert(0, _meipass_pre)
-del _sys_pre, _meipass_pre
+# Локальная папка с Whisper/torch — лежит рядом с merge_chat.py.
+# Должна попасть в sys.path ДО импорта whisper, иначе подтянется системный.
+from pathlib import Path as _PathPre
+_app_dir_pre = _PathPre(__file__).resolve().parent
+_local_pkgs_pre = _app_dir_pre / "local_packages"
+if _local_pkgs_pre.is_dir() and str(_local_pkgs_pre) not in _sys_pre.path:
+    _sys_pre.path.insert(0, str(_local_pkgs_pre))
 
-try:
-    import whisper as _whisper_module  # noqa
-except Exception:
-    # ImportError OR OSError (wrong arch torch on Apple Silicon) — handled gracefully
+# Модели Whisper качаем ВНУТРЬ папки проги (whisper_models/), а не в общий
+# ~/.cache/whisper — чтобы удаление MergeChat уносило их с собой.
+WHISPER_DOWNLOAD_ROOT = _app_dir_pre / "whisper_models"
+
+# Whisper берём ТОЛЬКО из local_packages самой проги (или из _MEIPASS в frozen-
+# сборке). Системный / пользовательский whisper (voice-diarizer, pip --user,
+# общий site-packages) намеренно НЕ подхватываем: иначе удаление MergeChat не
+# вычистит его — нарушение изоляции служебных файлов. Прога владеет своим
+# Whisper. Нет его в local_packages → расшифровка выключится с понятным
+# сообщением, пользователь поставит Whisper через GUI («О программе»).
+_whisper_owned = (_local_pkgs_pre / "whisper").is_dir() or bool(_meipass_pre)
+del _sys_pre, _meipass_pre, _PathPre, _app_dir_pre, _local_pkgs_pre
+
+if _whisper_owned:
+    try:
+        import whisper as _whisper_module  # noqa
+    except Exception:
+        # ImportError OR OSError (wrong arch torch on Apple Silicon) — handled gracefully
+        _whisper_module = None
+else:
     _whisper_module = None
 
 # ──────────────────────────────────────────────
@@ -176,6 +234,7 @@ except Exception:
 class Config:
     my_name: str        = "Я"
     my_names_lower: list = []
+    peer_name: str      = ""    # если задано — все НЕ-self авторы переименовываются в это
     use_whisper: bool   = False
     whisper_model: str  = "small"
     merge_gap: int      = 180
@@ -211,6 +270,26 @@ def normalize_author(name: str) -> str:
 # ──────────────────────────────────────────────
 #  Whisper
 # ──────────────────────────────────────────────
+
+def _release_whisper_memory():
+    """Освобождает Whisper-модель и GPU-кэш после завершения обработки.
+    Вызывается из process_folder/process_audio в финале — иначе модель medium на CPU
+    держит ~3-4 ГБ RAM пока процесс жив, и при следующем запуске жор удваивается."""
+    global _whisper_cache, _loaded_model_name
+    try:
+        _whisper_cache = None
+        _loaded_model_name = None
+        import gc as _gc
+        _gc.collect()
+        try:
+            import torch as _t
+            if _t.cuda.is_available():
+                _t.cuda.empty_cache()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 
 def _progress_bar(done: int, total: int, w: int = 25) -> str:
     real_total = max(done, total) if total else done or 1
@@ -288,7 +367,9 @@ def transcribe(file_path: Path) -> Optional[str]:
                 print(f"\n  Whisper '{CFG.whisper_model}' — GPU: {_device_name}")
 
             try:
-                _whisper_cache = whisper.load_model(CFG.whisper_model, device=_device)
+                _whisper_cache = whisper.load_model(
+                    CFG.whisper_model, device=_device,
+                    download_root=str(WHISPER_DOWNLOAD_ROOT))
                 _loaded_model_name = CFG.whisper_model
                 # MPS: force fp32 — fp16 gives NaN on Apple Silicon
                 if str(_device) == "mps":
@@ -308,7 +389,9 @@ def transcribe(file_path: Path) -> Optional[str]:
                     # GPU failed — retry on CPU
                     print(f"  Retrying on CPU...")
                     try:
-                        _whisper_cache = whisper.load_model(CFG.whisper_model, device="cpu")
+                        _whisper_cache = whisper.load_model(
+                            CFG.whisper_model, device="cpu",
+                            download_root=str(WHISPER_DOWNLOAD_ROOT))
                         _loaded_model_name = CFG.whisper_model
                         print(f"  Model loaded on CPU OK.")
                     except Exception as _cpu_err:
@@ -369,7 +452,9 @@ def transcribe(file_path: Path) -> Optional[str]:
                 _result_box[0] = _whisper_cache.transcribe(
                     str(file_path),
                     language="ru",
-                    verbose=False,
+                    verbose=None,  # None = полностью отключить tqdm-прогрессбар.
+                                   # False оставляет tqdm активным, и под pythonw.exe
+                                   # (sys.stdout=None) он падает с AttributeError.
                     fp16=_use_fp16,
                 )
             except Exception as _te:
@@ -396,7 +481,9 @@ def transcribe(file_path: Path) -> Optional[str]:
                 print(f"  [!] MPS NaN detected — falling back to CPU for all remaining files")
                 try:
                     import torch as _tt
-                    _whisper_cache = whisper.load_model(CFG.whisper_model, device="cpu")
+                    _whisper_cache = whisper.load_model(
+                        CFG.whisper_model, device="cpu",
+                        download_root=str(WHISPER_DOWNLOAD_ROOT))
                     _loaded_model_name = CFG.whisper_model
                     print(f"  Model reloaded on CPU OK.")
                     # Retry this file on CPU
@@ -752,6 +839,118 @@ def load_tg_json(json_path: Path, folder: Path) -> Tuple[List[dict], str]:
 
 
 # ──────────────────────────────────────────────
+#  Парсинг ВКонтакте JSON (vk_export через VK API)
+# ──────────────────────────────────────────────
+
+def _vk_json_body(m: dict) -> str:
+    """Текст одного VK-сообщения: сам текст + метки вложений + геометка."""
+    parts = []
+    t = (m.get("text") or "").strip()
+    if t:
+        parts.append(t)
+    for att in m.get("attachments", []) or []:
+        atype = att.get("type", "")
+        label = VK_JSON_ATTACH.get(atype, f"[{atype}]" if atype else "")
+        if atype == "doc" and (att.get("doc") or {}).get("title"):
+            label = f"[📄 Документ: {att['doc']['title'][:60]}]"
+        elif atype == "link" and (att.get("link") or {}).get("url"):
+            label = f"[🔗 {att['link']['url'][:100]}]"
+        elif atype == "audio":
+            a = att.get("audio") or {}
+            who = " — ".join(x for x in [a.get("artist"), a.get("title")] if x)
+            if who:
+                label = f"[🎵 Аудио: {who[:80]}]"
+        if label:
+            parts.append(label)
+    if m.get("geo"):
+        parts.append("[🗺️ Геолокация]")
+    return "\n".join(parts)
+
+
+def _vk_json_sender(m: dict, names: dict, peer_id, contact: str) -> str:
+    """Имя отправителя: out=1 → я; иначе из names{} (для бесед), либо контакт/ id."""
+    if m.get("out") == 1:
+        return CFG.my_name
+    fid = m.get("from_id")
+    raw = names.get(str(fid)) if fid is not None else None
+    if not raw:
+        if fid == peer_id and contact:
+            raw = contact
+        elif isinstance(fid, int) and fid < 0:
+            raw = f"club{-fid}"
+        else:
+            raw = f"id{fid}"
+    return normalize_author(raw)
+
+
+def load_vk_json(json_path: Path, folder: Path) -> Tuple[List[dict], str]:
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    names = {str(k): v for k, v in (data.get("names") or {}).items()}
+    peer_id = data.get("peer_id")
+    info = data.get("info") or {}
+    contact = (info.get("name") or "").strip()
+    if not contact and peer_id is not None:
+        contact = names.get(str(peer_id), "")
+
+    all_msgs: List[dict] = []
+    for m in data.get("messages", []):
+        if m.get("action"):          # служебные (создание беседы, инвайты, смена названия)
+            continue
+
+        sender = _vk_json_sender(m, names, peer_id, contact)
+        dt = None
+        ts = m.get("date")
+        if ts:
+            try:
+                dt = datetime.fromtimestamp(ts)
+            except:
+                pass
+
+        full_text = _vk_json_body(m)
+
+        # Пересланные
+        fwds = m.get("fwd_messages") or []
+        if fwds:
+            inner = []
+            for fm in fwds:
+                fs = _vk_json_sender(fm, names, peer_id, contact)
+                ft = _vk_json_body(fm).strip() or "сообщение"
+                if len(ft) > 75:
+                    ft = ft[:72] + "..."
+                inner.append(f"{fs}: {ft}")
+            full_text = (f"[переслано] {'; '.join(inner)}\n{full_text}").strip()
+
+        # Ответ
+        reply = m.get("reply_message")
+        if reply:
+            rs = _vk_json_sender(reply, names, peer_id, contact)
+            rt = _vk_json_body(reply).strip() or "сообщение"
+            if len(rt) > 75:
+                rt = rt[:72] + "..."
+            full_text = f"  ┌ {rs}: {rt}\n{full_text}"
+
+        if not full_text.strip():
+            continue
+
+        all_msgs.append({
+            "id":     m.get("id"),
+            "dt":     dt,
+            "sender": sender,
+            "text":   full_text,
+            "source": "vk",          # тот же тег, что и HTML — оба пути сливаются как [VK]
+        })
+
+    if not contact:
+        for mm in all_msgs:
+            if mm["sender"] != CFG.my_name:
+                contact = mm["sender"].split()[0]
+                break
+
+    print(f"  ВКонтакте (API JSON): контакт — {contact}, сообщений — {len(all_msgs)}")
+    return all_msgs, contact
+
+
+# ──────────────────────────────────────────────
 #  Парсинг Telegram HTML
 # ──────────────────────────────────────────────
 
@@ -982,14 +1181,39 @@ def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
         except Exception:
             continue
 
-        # Имя контакта — из participants, не «я»
+        # Собираем всех участников (для DM их обычно 2: я + собеседник)
+        _all_parts: List[str] = []
+        for p in data.get("participants", []):
+            _nm = _fix_instagram_encoding(p.get("name", ""))
+            if _nm and _nm not in _all_parts:
+                _all_parts.append(_nm)
+
+        # Имя контакта — тот, кто НЕ совпадает с алиасами «я»
         if not contact:
-            for p in data.get("participants", []):
-                name = _fix_instagram_encoding(p.get("name", ""))
-                norm = unicodedata.normalize("NFC", name).lower()
-                if norm not in CFG.my_names_lower:
-                    contact = name
+            _matched_self = None
+            for _nm in _all_parts:
+                if unicodedata.normalize("NFC", _nm).lower() in CFG.my_names_lower:
+                    _matched_self = _nm
                     break
+            if _matched_self:
+                # Алиас матчнулся — контакт это «другой» участник
+                for _nm in _all_parts:
+                    if _nm != _matched_self:
+                        contact = _nm
+                        break
+            elif _all_parts:
+                # Ни один алиас не подошёл (типичный кейс: пользователь ввёл «Я»,
+                # а в IG-экспорте он подписан полным именем «Артём Смагин»).
+                # Берём первого как peer-контакт.
+                contact = _all_parts[0]
+
+        # КРИТИЧНО: регистрируем всех НЕ-контактных участников как алиасы «себя».
+        # Иначе peer_display rename переименует свои сообщения в имя собеседника.
+        for _nm in _all_parts:
+            if _nm and _nm != contact:
+                _norm_n = unicodedata.normalize("NFC", _nm).lower()
+                if _norm_n not in CFG.my_names_lower:
+                    CFG.my_names_lower.append(_norm_n)
 
         for m in data.get("messages", []):
             try:
@@ -1033,6 +1257,7 @@ def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
                 "dt":     ts,
                 "sender": sender,
                 "text":   content,
+                "source": "ig",
             }
             if voice_path:
                 msg["_voice_path"] = voice_path
@@ -1193,6 +1418,30 @@ def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
             msg["_voice_path"] = voice_path
         messages.append(msg)
 
+    # WA-DM: ровно 2 уникальных отправителя. Если один из них матчит мои алиасы —
+    # ОК, другой = контакт. Если ни один не матчит — предупреждаем (полагаемся на
+    # старое contact-определение: первый не-self). Группы (3+) не трогаем.
+    _distinct = list({m["sender"] for m in messages if m.get("sender")})
+    if len(_distinct) == 2:
+        _matched_self = None
+        for _nm in _distinct:
+            if unicodedata.normalize("NFC", _nm).lower() in CFG.my_names_lower:
+                _matched_self = _nm
+                break
+        if _matched_self:
+            for _nm in _distinct:
+                if _nm != _matched_self:
+                    contact = _nm
+                    break
+            # Перетираем self → CFG.my_name
+            for _m in messages:
+                _s = _m.get("sender", "")
+                if _s and unicodedata.normalize("NFC", _s).lower() in CFG.my_names_lower:
+                    _m["sender"] = CFG.my_name
+        else:
+            print(f"  [!] WhatsApp: ни один отправитель не совпал с алиасами '{CFG.my_name}'. "
+                  f"Возможные имена: {_distinct}. Добавь правильное в поле 'Твоё имя' через запятую.")
+
     print(f"  WhatsApp: сообщений — {len(messages)}")
     return messages, contact
 
@@ -1218,7 +1467,30 @@ def load_chat_folder(folder: Path) -> Tuple[List[dict], str, str]:
         except Exception:
             pass
 
-    # ── Telegram / VK JSON ──────────────────────────────────────────
+    # ── VK API JSON (vk_export) ──────────────────────────────────────
+    # ДО Telegram JSON: формат vk_export тоже содержит ключ "messages",
+    # отличаем по наличию "peer_id" (маркер vk_fetch_history.py).
+    vk_json_files = []
+    if not _is_instagram:
+        for p in sorted(folder.glob("*.json")):
+            if re.match(r"message_\d+\.json", p.name):
+                continue
+            try:
+                d = json.loads(p.read_bytes().decode("utf-8", errors="replace"))
+            except:
+                continue
+            if isinstance(d, dict) and "peer_id" in d and isinstance(d.get("messages"), list):
+                vk_json_files.append(p)
+
+    for p in vk_json_files:
+        msgs, c = load_vk_json(p, folder)
+        all_msgs.extend(msgs)
+        if not contact and c:
+            contact = c
+        if "VK" not in srcs:
+            srcs.append("VK")
+
+    # ── Telegram / VK HTML JSON ──────────────────────────────────────
     json_path = None
     if not _is_instagram:
         if (folder / "result.json").exists():
@@ -1227,9 +1499,12 @@ def load_chat_folder(folder: Path) -> Tuple[List[dict], str, str]:
             for p in sorted(folder.glob("*.json")):
                 if re.match(r"message_\d+\.json", p.name):
                     continue  # уже обработано выше
+                if p in vk_json_files:
+                    continue  # VK-export уже обработан выше
                 try:
                     d = json.loads(p.read_bytes().decode("utf-8", errors="replace"))
-                    if isinstance(d, dict) and ("messages" in d or "chats" in d):
+                    if (isinstance(d, dict) and ("messages" in d or "chats" in d)
+                            and "peer_id" not in d):
                         json_path = p
                         break
                 except:
@@ -1302,24 +1577,64 @@ def merge_consecutive(messages: list) -> list:
 #  Форматирование вывода
 # ──────────────────────────────────────────────
 
+SOURCE_LABELS = {
+    "tg_json": "TG", "tg_html": "TG",
+    "vk":      "VK",
+    "ig":      "IG",
+    "wa":      "WA",
+}
+
+SOURCE_FULL = {
+    "tg_json": "TG JSON",
+    "tg_html": "TG HTML",
+    "vk":      "VK",
+    "ig":      "Instagram",
+    "wa":      "WhatsApp",
+}
+
+
+def _src_tag(msg: dict) -> str:
+    src = msg.get("source", "")
+    label = SOURCE_LABELS.get(src, src.upper() if src else "")
+    return f"[{label}] " if label else ""
+
+
+def _source_counts(messages: list) -> str:
+    from collections import Counter as _C
+    cnt = _C(m.get("source") or "?" for m in messages)
+    known_order = ["tg_json", "tg_html", "vk", "wa", "ig"]
+    parts = []
+    for code in known_order:
+        if cnt.get(code):
+            parts.append(f"{SOURCE_FULL[code]} — {cnt[code]}")
+    other = sum(v for k, v in cnt.items() if k not in known_order)
+    if other:
+        parts.append(f"прочее — {other}")
+    return ", ".join(parts) if parts else ""
+
+
 def format_output(messages: list, sources: list, contact: str,
-                  fmt: str = "txt", show_timestamps: bool = True) -> str:
+                  fmt: str = "txt", show_timestamps: bool = True,
+                  show_source: bool = False) -> str:
     """
     fmt: 'txt' — текстовый формат (по умолчанию)
          'md'  — Markdown формат
     show_timestamps: False — убирает метки времени из вывода
+    show_source: True — добавляет метку источника [TG]/[VK]/... перед автором
     """
     if fmt == "md":
-        return _format_markdown(messages, sources, contact, show_timestamps)
-    return _format_txt(messages, sources, contact, show_timestamps)
+        return _format_markdown(messages, sources, contact, show_timestamps, show_source)
+    return _format_txt(messages, sources, contact, show_timestamps, show_source)
 
 
-def _format_txt(messages: list, sources: list, contact: str, show_timestamps: bool = True) -> str:
+def _format_txt(messages: list, sources: list, contact: str,
+                show_timestamps: bool = True, show_source: bool = False) -> str:
+    _sc = _source_counts(messages)
     lines = [
         "=" * 56,
         f"Переписка: {contact}",
         f"Источники: {', '.join(sources)}",
-        f"Сообщений: {len(messages)}",
+        f"Сообщений: {len(messages)}" + (f"  ({_sc})" if _sc else ""),
         "=" * 56,
     ]
 
@@ -1352,19 +1667,22 @@ def _format_txt(messages: list, sources: list, contact: str, show_timestamps: bo
 
         text_lines = msg["text"].split("\n")
         prefix = f"{ts} " if show_timestamps else ""
-        lines.append(f"{prefix}{msg['sender']}: {text_lines[0]}")
+        src = _src_tag(msg) if show_source else ""
+        lines.append(f"{prefix}{src}{msg['sender']}: {text_lines[0]}")
         for line in text_lines[1:]:
             lines.append(f"  {line}")
 
     return "\n".join(lines)
 
 
-def _format_markdown(messages: list, sources: list, contact: str, show_timestamps: bool = True) -> str:
+def _format_markdown(messages: list, sources: list, contact: str,
+                     show_timestamps: bool = True, show_source: bool = False) -> str:
+    _sc = _source_counts(messages)
     lines = [
         f"# Переписка: {contact}",
         "",
         f"**Источники:** {', '.join(sources)}  ",
-        f"**Сообщений:** {len(messages)}",
+        f"**Сообщений:** {len(messages)}" + (f"  _({_sc})_" if _sc else ""),
         "",
         "---",
         "",
@@ -1415,7 +1733,8 @@ def _format_markdown(messages: list, sources: list, contact: str, show_timestamp
         # Основная строка с меткой времени
         first = content_lines[0] if content_lines else ""
         ts_prefix = f"`{ts}` " if show_timestamps else ""
-        lines.append(f"{ts_prefix}{sender_md}: {first}")
+        src = _src_tag(msg) if show_source else ""
+        lines.append(f"{ts_prefix}{src}{sender_md}: {first}")
         for line in content_lines[1:]:
             lines.append(f"  {line}")
         lines.append("")
@@ -1596,7 +1915,12 @@ def process_folder(folder_path: str,
                    date_from: str = "",
                    date_to: str = "",
                    show_timestamps: bool = True,
-                   split_mode: str = "none") -> Optional[str]:
+                   split_mode: str = "none",
+                   show_source: bool = False,
+                   filter_author: str = "",
+                   filter_text: str = "",
+                   my_display: str = "",
+                   peer_display: str = "") -> Optional[str]:
     """split_mode: 'none' | 'month' | 'year'"""
     """
     Высокоуровневая функция для GUI.
@@ -1620,11 +1944,25 @@ def process_folder(folder_path: str,
 
     try:
         import unicodedata as _ud
-        CFG.my_name        = author
-        CFG.my_names_lower = [_ud.normalize("NFC", author).lower()]
-        if author.lower() not in ("вы", "я", "me", "i"):
-            CFG.my_names_lower += [author.lower().replace("ём","ем"),
-                                   _ud.normalize("NFD", author).lower()]
+        # Поле «Твоё имя» может быть списком через запятую: "Артём, Tema, Artem"
+        # — все эти имена считаются "мной" (алиасы). Display = первый элемент,
+        # либо явный override через my_display.
+        _aliases = [a.strip() for a in (author or "").split(",") if a.strip()]
+        if not _aliases:
+            _aliases = ["Я"]
+        _display_self = my_display.strip() or _aliases[0]
+        CFG.my_name = _display_self
+        _lows = []
+        for _a in _aliases:
+            _al = _ud.normalize("NFC", _a).lower()
+            _lows.append(_al)
+            if _al not in ("вы", "я", "me", "i"):
+                _lows.append(_a.lower().replace("ём", "ем"))
+                _lows.append(_ud.normalize("NFD", _a).lower())
+        # Стандартные «вы»/«я»/«me» всегда считаем собой
+        _lows += ["вы", "я", "me", "i"]
+        CFG.my_names_lower = list(dict.fromkeys(_lows))  # уникальные с сохранением порядка
+        CFG.peer_name = peer_display.strip()
         CFG.use_whisper    = True
         CFG.whisper_model  = model
         CFG.do_merge       = do_merge
@@ -1742,6 +2080,7 @@ def process_folder(folder_path: str,
         for i, v in enumerate(valid):
             if _cancel_event and _cancel_event.is_set():
                 if log_cb: log_cb("--- Отменено ---")
+                _release_whisper_memory()
                 return None
             msgs, c, src = load_chat_folder(v)
             if src: sources.extend(src if isinstance(src, list) else [src])
@@ -1875,13 +2214,45 @@ def process_folder(folder_path: str,
                 else:
                     if log_cb: log_cb(f"[!] Имя автора '{author}' не найдено ни у одного отправителя.")
 
+        if filter_author or filter_text:
+            import re as _ref
+            _fa = filter_author.strip().lower()
+            _ft_pat = None
+            if filter_text.strip():
+                try:
+                    _ft_pat = _ref.compile(filter_text.strip(), _ref.IGNORECASE)
+                except _ref.error as _re_err:
+                    if log_cb: log_cb(f"[!] Regex в фильтре невалиден: {_re_err}. Фильтр по тексту отключён.")
+            before = len(all_messages)
+            all_messages = [
+                m for m in all_messages
+                if (not _fa or _fa in (m.get("sender") or "").lower())
+                   and (_ft_pat is None or _ft_pat.search(m.get("text") or ""))
+            ]
+            if log_cb: log_cb(f"  Фильтр: {before} → {len(all_messages)} сообщений")
+
         if CFG.do_merge:
             all_messages = merge_consecutive(all_messages)
+
+        # Если задан peer_display — переименовываем всех НЕ-self авторов в это имя.
+        # Решает проблему «у одного человека разные подписи в TG/VK/IG/WA».
+        if CFG.peer_name:
+            _renamed = 0
+            for _m in all_messages:
+                _s = _m.get("sender") or ""
+                if _s and _s != CFG.my_name:
+                    _m["sender"] = CFG.peer_name
+                    _renamed += 1
+            if log_cb and _renamed:
+                log_cb(f"  Имена в выводе: «Я» → '{CFG.my_name}', собеседник → '{CFG.peer_name}' ({_renamed} сообщений)")
 
         if progress_cb: progress_cb(0.8)
 
         if not contact or contact.strip() in (".", "", ".."):
             contact = valid[0].name if valid[0].name not in (".", "..") else "чат"
+        # Имя контакта в шапке/имени файла = peer_display, если задано.
+        if CFG.peer_name:
+            contact = CFG.peer_name
         import re as _re
         safe = _re.sub(r'[\\/*?:"<>|]', "", contact.split()[0]).strip()
         if not safe:
@@ -1905,7 +2276,7 @@ def process_folder(folder_path: str,
                     continue
                 chunk = list(group)
                 chunk_path = output_dir / f"{safe}_{label}{ext}"
-                result = format_output(chunk, sources, contact, output_format, show_timestamps)
+                result = format_output(chunk, sources, contact, output_format, show_timestamps, show_source)
                 chunk_path.write_text(result, encoding="utf-8")
                 kb = chunk_path.stat().st_size // 1024
                 if log_cb: log_cb(f"  → {chunk_path.name} ({len(chunk)} сообщ., {kb} КБ)")
@@ -1913,14 +2284,14 @@ def process_folder(folder_path: str,
                 out_path = chunk_path
             if without_dt:
                 nd_path = output_dir / f"{safe}_no_date{ext}"
-                result = format_output(without_dt, sources, contact, output_format, show_timestamps)
+                result = format_output(without_dt, sources, contact, output_format, show_timestamps, show_source)
                 nd_path.write_text(result, encoding="utf-8")
                 files_written += 1
             if progress_cb: progress_cb(1.0)
             if log_cb: log_cb(f"\n✓ Готово → {output_dir} ({files_written} файлов)")
         else:
             out_path = output_dir / f"{safe}{ext}"
-            result = format_output(all_messages, sources, contact, output_format, show_timestamps)
+            result = format_output(all_messages, sources, contact, output_format, show_timestamps, show_source)
             out_path.write_text(result, encoding="utf-8")
             if progress_cb: progress_cb(1.0)
             kb = out_path.stat().st_size // 1024
@@ -1930,6 +2301,7 @@ def process_folder(folder_path: str,
         _m,_s=divmod(int(_elapsed),60)
         if log_cb: log_cb(f"  Время обработки: {_m} мин {_s} сек")
 
+        _release_whisper_memory()
         return str(out_path)
 
     except Exception as e:
@@ -1941,6 +2313,154 @@ def process_folder(folder_path: str,
     finally:
         _sys.stdout = old_stdout
         _sys.stderr = old_stderr
+
+
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus",
+              ".aac", ".flac", ".webm", ".amr", ".mp4"}
+
+
+def process_audio(source_path: str,
+                  model: str = "small",
+                  output_format: str = "txt",
+                  show_timestamps: bool = True,
+                  log_cb=None,
+                  progress_cb=None) -> Optional[str]:
+    """Режим транскрипции аудио: один файл или папка только с аудио.
+    Возвращает путь к итоговому .txt/.md или None."""
+    src = Path(source_path)
+    if not src.exists():
+        if log_cb: log_cb(f"Не найден путь: {src}")
+        return None
+
+    if src.is_file():
+        files = [src] if src.suffix.lower() in AUDIO_EXTS else []
+        out_dir = src.parent
+        out_name = src.stem
+    else:
+        files = sorted(
+            p for p in src.rglob("*")
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTS
+        )
+        out_dir = src
+        out_name = src.name or "audio"
+
+    if not files:
+        if log_cb: log_cb("Аудио-файлов не найдено.")
+        return None
+
+    CFG.use_whisper = True
+    CFG.whisper_model = model
+    _voice_counter["done"] = 0
+    _voice_counter["total"] = len(files)
+
+    if log_cb: log_cb(f"Найдено аудио: {len(files)} файл(ов)")
+    if log_cb: log_cb(f"  Модель: {model}")
+
+    # Устройство расшифровки — единый формат с process_folder, чтобы пользователь
+    # сразу видел, на CPU или GPU будет работать.
+    _is_frozen = getattr(__import__('sys'), 'frozen', False)
+    _dev = 'CPU'
+    _cpu_reason = ''
+    if not _is_frozen:
+        try:
+            import torch as _tp
+            _tv = getattr(_tp, '__version__', '?')
+            if _tp.cuda.is_available():
+                _dev = f'NVIDIA {_tp.cuda.get_device_name(0)}'
+            elif hasattr(_tp.backends, 'mps') and _tp.backends.mps.is_available():
+                _dev = 'Apple Silicon MPS'
+            else:
+                _cuda_built = getattr(getattr(_tp, 'version', None), 'cuda', None)
+                if _cuda_built is None:
+                    _cpu_reason = f' (torch {_tv} без CUDA — переустанови torch с CUDA для GPU)'
+                else:
+                    _cpu_reason = f' (torch {_tv} CUDA {_cuda_built} собран, но GPU не виден)'
+                try:
+                    import torch_directml as _tdml; _dev = 'AMD/Intel (DirectML)'; _cpu_reason = ''
+                except ImportError:
+                    pass
+        except ImportError:
+            _cpu_reason = ' (torch не установлен)'
+    _is_frozen_win = _is_frozen and __import__('sys').platform == 'win32'
+    if log_cb:
+        _suffix = ' (exe-сборка Windows — GPU недоступен)' if _is_frozen_win else _cpu_reason
+        log_cb(f"  Устройство расшифровки: {_dev}{_suffix}")
+
+    # Диагностика окружения — сразу видно если что-то не так с ffmpeg/Whisper.
+    try:
+        import shutil as _sh
+        _ff_sys = _sh.which("ffmpeg")
+        _ff_tmp = _sh.which("ffmpeg.exe") if not _ff_sys else _ff_sys
+        if log_cb:
+            log_cb(f"  ffmpeg: {_ff_tmp or _ff_sys or 'НЕ НАЙДЕН (Whisper упадёт)'}")
+        if _whisper_module is None:
+            if log_cb: log_cb("  ⚠ Whisper не установлен в саму прогу — голосовые "
+                              "не расшифруются. Поставь Whisper через «О программе» в окне MergeChat.")
+    except Exception:
+        pass
+
+    blocks = []
+    _bar_w = 25  # ширина прогресс-бара в символах — как в process_folder
+    for i, f in enumerate(files, 1):
+        if _cancel_event and _cancel_event.is_set():
+            if log_cb: log_cb("--- Отмена ---")
+            break
+        if log_cb: log_cb(f"  [{i}/{len(files)}] Transcribing: {f.name}")
+        if progress_cb:
+            progress_cb(0.05 + 0.9 * (i - 1) / max(len(files), 1))
+        try:
+            size_kb = f.stat().st_size // 1024
+        except Exception:
+            size_kb = 0
+        try:
+            raw = transcribe(f)
+        except Exception as ex:
+            if log_cb: log_cb(f"  Ошибка transcribe(): {ex}")
+            raw = None
+        text = (raw or "").strip()
+        ts = ""
+        if show_timestamps:
+            try:
+                mtime = datetime.fromtimestamp(f.stat().st_mtime)
+                ts = mtime.strftime("[%Y-%m-%d %H:%M] ")
+            except Exception:
+                ts = ""
+        head = f"{ts}{f.name}".strip()
+        if text:
+            body = text
+        elif raw is None:
+            body = (f"(транскрипция не выполнена — размер {size_kb} КБ; "
+                    f"проверь лог выше: ffmpeg / Whisper / GPU)")
+        else:
+            body = "(Whisper отработал, но текст пустой — тишина или слишком короткое аудио)"
+        blocks.append(f"=== {head} ===\n{body}\n")
+
+        # Прогрессбар тем же стилем, что в process_folder — пользователь видит,
+        # что расшифровка идёт и сколько примерно осталось.
+        if log_cb:
+            _pct = i / max(len(files), 1)
+            _filled = int(_bar_w * _pct)
+            _bar = "█" * _filled + "░" * (_bar_w - _filled)
+            _preview = (text[:55] + "...") if len(text) > 55 else (text or "")
+            log_cb(f"  [{_bar}] {i}/{len(files)} ({int(_pct*100)}%)" +
+                   (f"  «{_preview}»" if _preview else ""))
+
+    if not blocks:
+        _release_whisper_memory()
+        return None
+
+    ext = ".md" if output_format == "md" else ".txt"
+    safe = re.sub(r'[\\/*?:"<>|]', "", out_name).strip() or "audio"
+    out_path = out_dir / f"{safe}_audio{ext}"
+    header = (f"Расшифровка аудио\nИсточник: {src}\n"
+              f"Файлов: {len(blocks)}\nМодель: {model}\n"
+              + ("=" * 60) + "\n\n")
+    out_path.write_text(header + "\n".join(blocks), encoding="utf-8")
+    if progress_cb: progress_cb(1.0)
+    kb = out_path.stat().st_size // 1024
+    if log_cb: log_cb(f"\n✓ Готово → {out_path} ({kb} КБ)")
+    _release_whisper_memory()
+    return str(out_path)
 
 
 if __name__ == "__main__":

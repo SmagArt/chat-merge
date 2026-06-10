@@ -27,11 +27,14 @@ if "!PY!"=="" (
 
 echo %DATE% %TIME% Python: !PY! >> "%LOGFILE%"
 
-for %%D in ("!PY!") do set "PYDIR=%%~dpD"
-mkdir "!PYDIR!Lib\site-packages" 2>nul
+REM Whisper/torch ставим в local_packages самой проги — изоляция служебных
+REM файлов: удаление MergeChat уносит их с собой. НЕ в site-packages Python.
+set "TARGET=%~dp0local_packages"
+mkdir "%TARGET%" 2>nul
+set "PYTHONPATH=%TARGET%"
 
 echo [PHASE:DOWNLOAD_WHISPER] >> "%LOGFILE%"
-"!PY!" -m pip install --no-user openai-whisper >> "%LOGFILE%" 2>&1
+"!PY!" -m pip install --target "%TARGET%" --upgrade openai-whisper >> "%LOGFILE%" 2>&1
 echo %DATE% %TIME% whisper exit=!ERRORLEVEL! >> "%LOGFILE%"
 
 powershell -NoProfile -Command "(Get-WmiObject Win32_VideoController).Name" 2>nul | findstr /i "nvidia" >nul
@@ -42,12 +45,12 @@ if !ERRORLEVEL!==0 (
         goto :done_torch
     )
     echo [PHASE:DOWNLOAD_TORCH_CUDA] >> "%LOGFILE%"
-    echo %DATE% %TIME% NVIDIA found - installing torch CUDA 12.8 >> "%LOGFILE%"
-    "!PY!" -m pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall >> "%LOGFILE%" 2>&1
+    echo %DATE% %TIME% NVIDIA found - installing torch CUDA 12.4 >> "%LOGFILE%"
+    "!PY!" -m pip install --target "%TARGET%" --upgrade torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall >> "%LOGFILE%" 2>&1
 ) else (
     echo [PHASE:DOWNLOAD_TORCH_CPU] >> "%LOGFILE%"
     echo %DATE% %TIME% No NVIDIA - torch CPU >> "%LOGFILE%"
-    "!PY!" -m pip install torch >> "%LOGFILE%" 2>&1
+    "!PY!" -m pip install --target "%TARGET%" --upgrade torch >> "%LOGFILE%" 2>&1
 )
 :done_torch
 echo %DATE% %TIME% torch exit=!ERRORLEVEL! >> "%LOGFILE%"

@@ -45,18 +45,22 @@ rm -rf "$STAGING"
 mkdir -p "$STAGING"
 cp -r dist/MergeChat.app "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
+# Скрипт выгрузки ВК через API (запускать своим python3: pip install requests; см. README).
+# Только сам файл — без tools/.env и tools/vk_export (личные данные).
+mkdir -p "$STAGING/tools"
+cp tools/vk_fetch_history.py "$STAGING/tools/" 2>/dev/null || true
 
 hdiutil create \
     -volname "Merge Chat" \
     -srcfolder "$STAGING" \
     -ov -format UDZO \
-    dist_mac/MergeChat_v2.4.dmg 2>&1 | tee -a "$LOG"
+    dist_mac/MergeChat_v2.5.dmg 2>&1 | tee -a "$LOG"
 
 rm -rf "$STAGING"
 
-if [ -f "dist_mac/MergeChat_v2.4.dmg" ]; then
+if [ -f "dist_mac/MergeChat_v2.5.dmg" ]; then
     echo ""
-    echo "[OK] dist_mac/MergeChat_v2.4.dmg ready" | tee -a "$LOG"
+    echo "[OK] dist_mac/MergeChat_v2.5.dmg ready" | tee -a "$LOG"
 else
     echo "[X] DMG creation failed" | tee -a "$LOG"
 fi

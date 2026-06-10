@@ -4,4 +4,6 @@ customtkinter>=5.2
 imageio-ffmpeg>=0.4
 certifi
 tkinterdnd2
+requests          # tools/vk_fetch_history.py — выгрузка ВК через API
+python-dotenv     # tools/vk_fetch_history.py — токен из tools/.env
 # torch installed separately (CUDA/MPS/CPU depending on hardware)
