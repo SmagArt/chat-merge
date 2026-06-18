@@ -63,6 +63,31 @@ _WHISPER_OK = _whisper_available()
 # Размер каждой модели — для подсказки «докачается ~X» в статусе модели.
 _MODEL_SIZE = {"tiny": "75 МБ", "base": "145 МБ", "small": "480 МБ",
                "medium": "1.5 ГБ", "large": "2.9 ГБ"}
+# Минимальный «здоровый» размер .pt в байтах (~90% от реального). Файл меньше
+# этого порога = недокачанный/битый: whisper при запуске не сойдётся по SHA256
+# и молча перекачает. Проверяем тут, чтобы не показывать ложное «готова».
+_MODEL_MIN_BYTES = {"tiny": 65_000_000, "base": 125_000_000,
+                    "small": 430_000_000, "medium": 1_350_000_000,
+                    "large": 2_750_000_000}
+
+# Официальные URL моделей OpenAI Whisper. SHA256 модели = предпоследний сегмент
+# пути URL (whisper так и хранит). Имя сохраняемого файла = basename URL, чтобы
+# совпасть с тем, как whisper.load_model сам кладёт файл (для «large» это
+# large-v3.pt) — иначе whisper не найдёт нашу копию и полезет качать заново.
+_WHISPER_URLS = {
+    "tiny":   "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e/tiny.pt",
+    "base":   "https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt",
+    "small":  "https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt",
+    "medium": "https://openaipublic.azureedge.net/main/whisper/models/345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1/medium.pt",
+    "large":  "https://openaipublic.azureedge.net/main/whisper/models/e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb/large-v3.pt",
+}
+
+def _model_url_parts(m: str):
+    """(url, sha256, dest_path) для модели m. dest = whisper_models/<basename>."""
+    url = _WHISPER_URLS[m]
+    sha = url.rsplit("/", 2)[-2]
+    dest = WHISPER_MODELS / url.rsplit("/", 1)[-1]
+    return url, sha, dest
 
 # ВСЕГДА ctk.CTk - DnD инжектируется через _require() после создания окна
 _BaseApp = ctk.CTk
@@ -90,7 +115,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.7"
+VERSION = "2.8"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -688,6 +713,23 @@ class App(_BaseApp):
         self._model_status = ctk.CTkLabel(si, text="", font=self._f(10),
                                           text_color=T("SUB"), anchor="w")
         self._model_status.pack(fill="x", padx=(244, 0), pady=(2, 0))
+
+        # Кнопки управления выбранной моделью — действуют на физический файл
+        # whisper_models/<model>.pt. «Скачать» доступна когда модели нет/битая,
+        # «Удалить» — когда файл на диске есть. Состояние правит _update_model_status.
+        mbtns_row = ctk.CTkFrame(si, fg_color="transparent")
+        mbtns_row.pack(fill="x", padx=(244, 0), pady=(4, 0))
+        self._model_dl_btn = ctk.CTkButton(
+            mbtns_row, text="⬇ Скачать модель", width=170, height=28,
+            font=self._f(11), fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
+            corner_radius=7, command=self._download_selected_model)
+        self._model_dl_btn.pack(side="left", padx=(0, 6))
+        self._model_del_btn = ctk.CTkButton(
+            mbtns_row, text="🗑 Удалить модель", width=170, height=28,
+            font=self._f(11), fg_color=T("SURFACE"), hover_color="#882828",
+            border_color=T("BORDER"), border_width=1, corner_radius=7,
+            command=self._delete_selected_model)
+        self._model_del_btn.pack(side="left")
 
         ctk.CTkFrame(si, fg_color=T("BORDER"), height=1).pack(fill="x", pady=8)
 
@@ -1341,13 +1383,25 @@ class App(_BaseApp):
             b.configure(fg_color=T("ACCENT") if k == m else T("SURFACE"))
         self._update_model_status()
 
-    def _model_downloaded(self, m: str) -> bool:
-        """Скачана ли модель m — есть ли whisper_models/<m>*.pt.
-        Маска со звёздочкой: «large» сохраняется whisper'ом как large-v3.pt."""
+    def _model_state(self, m: str) -> str:
+        """Состояние модели m: 'ok' | 'partial' | 'absent'.
+        Маска со звёздочкой: «large» сохраняется whisper'ом как large-v3.pt.
+        'partial' — файл есть, но меньше порога (недокачан/битый): whisper
+        не сойдётся по SHA256 и перекачает. Не считать такой файл готовым."""
         try:
-            return any(WHISPER_MODELS.glob(f"{m}*.pt"))
+            files = list(WHISPER_MODELS.glob(f"{m}*.pt"))
         except Exception:
-            return False
+            return "absent"
+        if not files:
+            return "absent"
+        floor = _MODEL_MIN_BYTES.get(m, 0)
+        if any(f.stat().st_size >= floor for f in files):
+            return "ok"
+        return "partial"
+
+    def _model_downloaded(self, m: str) -> bool:
+        """Готова ли модель m к работе (есть и не битая)."""
+        return self._model_state(m) == "ok"
 
     def _update_model_status(self):
         """Подсветить кнопки моделей по факту скачивания (зелёная рамка) и
@@ -1361,20 +1415,347 @@ class App(_BaseApp):
             except Exception:
                 pass
         m = self.model_var.get() if hasattr(self, "model_var") else ""
+        state = self._model_state(m)
+        sz = _MODEL_SIZE.get(m, "?")
         if not getattr(self, "_whisper_installed", False):
             self._model_status.configure(
                 text="Whisper не установлен — модели расшифровки недоступны",
                 text_color=T("SUB"))
-        elif self._model_downloaded(m):
+        elif state == "ok":
             self._model_status.configure(
                 text=f"✓ модель «{m}» скачана, готова к работе",
                 text_color=T("GREEN"))
-        else:
-            sz = _MODEL_SIZE.get(m, "?")
+        elif state == "partial":
             self._model_status.configure(
-                text=f"↓ модель «{m}» ещё не скачана — докачается (~{sz}) "
-                     f"при первом запуске расшифровки",
+                text=f"⚠ модель «{m}» скачана не полностью (битый файл) — "
+                     f"нажмите «Скачать модель», чтобы докачать (~{sz})",
                 text_color="#E8944A")
+        else:
+            self._model_status.configure(
+                text=f"↓ модель «{m}» не скачана — нажмите «Скачать модель» "
+                     f"(~{sz}) или она докачается при первом запуске",
+                text_color="#E8944A")
+        # Кнопки управления моделью: «Скачать» когда не готова, «Удалить» когда
+        # файл есть. Во время идущей загрузки обе заблокированы.
+        if hasattr(self, "_model_dl_btn"):
+            busy = getattr(self, "_model_dl_active", False)
+            can_dl = (m in _WHISPER_URLS) and state != "ok" and not busy
+            can_del = state != "absent" and not busy
+            try:
+                self._model_dl_btn.configure(
+                    state="normal" if can_dl else "disabled",
+                    text="⬇ Докачать модель" if state == "partial" else "⬇ Скачать модель")
+                self._model_del_btn.configure(
+                    state="normal" if can_del else "disabled")
+            except Exception:
+                pass
+
+    # ──────────────────────────────────────────────────────────
+    #  Управление моделями Whisper — кнопками, с отражением на диске
+    # ──────────────────────────────────────────────────────────
+    def _delete_selected_model(self):
+        """Физически удалить .pt выбранной модели из whisper_models/."""
+        m = self.model_var.get() if hasattr(self, "model_var") else ""
+        files = list(WHISPER_MODELS.glob(f"{m}*.pt")) + \
+                list(WHISPER_MODELS.glob(f"{m}*.pt.part"))
+        if not files:
+            return
+        total_mb = sum(f.stat().st_size for f in files) / 1024 / 1024
+        overlay, content, close = self._overlay(
+            "Удалить модель", width=460, height=220)
+        ctk.CTkLabel(content,
+                     text=f"Удалить модель «{m}» с диска?\n"
+                          f"Освободится ~{total_mb:.0f} МБ. Скачать заново можно "
+                          f"кнопкой «Скачать модель».",
+                     font=self._f(11), text_color=T("SUB"),
+                     justify="center").pack(pady=(6, 14))
+        bf = ctk.CTkFrame(content, fg_color="transparent"); bf.pack()
+
+        def do_del():
+            errs = []
+            for f in files:
+                try:
+                    f.unlink()
+                except Exception as e:
+                    errs.append(str(e))
+            close()
+            self._update_model_status()
+            if errs:
+                self._overlay_message("Ошибка удаления", "\n".join(errs))
+
+        ctk.CTkButton(bf, text="Отмена", width=120, height=36, font=self._f(12),
+                      fg_color=T("SURFACE"), hover_color=T("BORDER"),
+                      text_color=T("SUB"), corner_radius=8,
+                      command=close).pack(side="left", padx=6)
+        ctk.CTkButton(bf, text="Удалить", width=120, height=36,
+                      font=self._f(12, "bold"), fg_color="#AA3333",
+                      hover_color="#882828", corner_radius=8,
+                      command=do_del).pack(side="left", padx=6)
+
+    def _overlay_message(self, title: str, msg: str):
+        """Простое модальное сообщение с кнопкой «Ок»."""
+        overlay, content, close = self._overlay(title, width=460, height=200)
+        ctk.CTkLabel(content, text=msg, font=self._f(11), text_color=T("TEXT"),
+                     justify="center", wraplength=400).pack(pady=(10, 16))
+        ctk.CTkButton(content, text="Ок", width=120, height=36,
+                      font=self._f(12, "bold"), fg_color=T("ACCENT"),
+                      hover_color=T("ACCENT2"), corner_radius=8,
+                      command=close).pack()
+
+    def _download_selected_model(self):
+        """Скачать выбранную модель в whisper_models/ — с докачкой и проверкой
+        SHA256. Канал к CDN из РФ медленный, поэтому: резюмируемая загрузка
+        (Range) + контрольная сумма, чтобы обрыв не оставлял битый файл."""
+        m = self.model_var.get() if hasattr(self, "model_var") else ""
+        if m not in _WHISPER_URLS:
+            return
+        url, sha, dest = _model_url_parts(m)
+        sz = _MODEL_SIZE.get(m, "?")
+        cancel = threading.Event()
+
+        overlay, content, close = self._overlay(
+            f"Скачивание модели «{m}»", width=560, height=360)
+        ctk.CTkLabel(content,
+                     text=f"Модель «{m}» (~{sz}) скачивается в папку программы.\n"
+                          "Можно прервать и докачать позже — прогресс сохраняется.",
+                     font=self._f(11), text_color=T("SUB"),
+                     justify="center").pack(pady=(2, 10))
+        pbar = ctk.CTkProgressBar(content, height=8, fg_color=T("SURFACE"),
+                                  progress_color=T("ACCENT"), corner_radius=2)
+        pbar.pack(fill="x", pady=(4, 2)); pbar.set(0)
+        plbl = ctk.CTkLabel(content, text="Подключение…", font=self._f(10),
+                            text_color=T("SUB"))
+        plbl.pack(anchor="w")
+        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
+                                 text_color=T("TEXT"), height=140, corner_radius=8,
+                                 border_color=T("BORDER"), border_width=1)
+        log_box.pack(fill="both", expand=True, pady=(8, 8))
+        log_box.configure(state="disabled")
+        bf = ctk.CTkFrame(content, fg_color="transparent"); bf.pack(fill="x")
+        action_btn = ctk.CTkButton(bf, text="Отмена", width=130, height=36,
+                                   font=self._f(12), fg_color=T("SURFACE"),
+                                   hover_color="#882828", text_color=T("SUB"),
+                                   corner_radius=8, command=cancel.set)
+        action_btn.pack(side="right")
+
+        def _append(line):
+            log_box.configure(state="normal")
+            log_box.insert("end", line + "\n"); log_box.see("end")
+            log_box.configure(state="disabled")
+
+        def progress(frac, done, total, speed):
+            pbar.set(max(0.0, min(1.0, frac)))
+            plbl.configure(text=f"{done/1024/1024:.0f} / {total/1024/1024:.0f} МБ  "
+                                f"·  {speed:.1f} МБ/с")
+
+        def done(success, message):
+            self._model_dl_active = False
+            self._update_model_status()
+            _append(message)
+            if success:
+                pbar.set(1.0)
+                plbl.configure(text="Готово — модель проверена и готова к работе.",
+                               text_color=T("GREEN"))
+            else:
+                plbl.configure(text=message, text_color="#E8944A")
+            action_btn.configure(text="Закрыть", fg_color=T("SURFACE"),
+                                 hover_color=T("BORDER"), command=close)
+
+        self._model_dl_active = True
+        self._update_model_status()
+        ui = {
+            "append":  lambda s: self.after(0, _append, s),
+            "progress": lambda *a: self.after(0, progress, *a),
+            "status":  lambda s: self.after(0, plbl.configure, {"text": s}),
+            "done":    lambda ok, msg: self.after(0, done, ok, msg),
+            "cancel":  cancel,
+        }
+        threading.Thread(target=self._download_model_worker,
+                         args=(m, ui), daemon=True).start()
+
+    # Качаем модель в N параллельных соединений (как менеджер загрузок/торрент):
+    # один HTTPS-поток к CDN из РФ шейпится, а 8 потоков складывают скорость.
+    _DL_CONNECTIONS = 8
+    _DL_CHUNK = 16 * 1024 * 1024   # размер куска под одно Range-соединение
+
+    def _download_model_worker(self, m, ui):
+        import hashlib, urllib.request, time, json
+        import threading as _th, queue as _q
+        try:
+            url, sha, dest = _model_url_parts(m)
+            WHISPER_MODELS.mkdir(parents=True, exist_ok=True)
+            part = dest.with_name(dest.name + ".part")
+            idxf = dest.with_name(dest.name + ".idx")   # индекс готовых кусков
+            ui["append"](f"Источник: {url}")
+            ui["append"](f"Файл: {dest}")
+
+            # Узнаём полный размер + поддержку Range (Content-Range при 206).
+            def _probe():
+                rq = urllib.request.Request(url)
+                rq.add_header("Range", "bytes=0-0")
+                r = urllib.request.urlopen(rq, timeout=30)
+                cr = r.headers.get("Content-Range", "")
+                code = r.getcode()
+                cl = r.headers.get("Content-Length")
+                r.close()
+                if code == 206 and "/" in cr:
+                    return int(cr.rsplit("/", 1)[-1]), True
+                return int(cl or 0), False
+            total, ranges = _probe()
+
+            if not ranges or total <= 0:
+                ui["append"]("Сервер не поддержал многопоточность — качаю в 1 поток")
+                return self._download_single_stream(url, sha, dest, part, total, ui)
+
+            n_conn = max(1, min(self._DL_CONNECTIONS, (total // self._DL_CHUNK) + 1))
+            n_chunks = (total + self._DL_CHUNK - 1) // self._DL_CHUNK
+            ui["append"](f"Размер: {total/1024/1024:.0f} МБ · потоков: {n_conn} · "
+                         f"кусков по {self._DL_CHUNK//1024//1024} МБ: {n_chunks}")
+
+            # Докачка: читаем индекс готовых кусков, если .part уже нужного размера.
+            done_idx = set()
+            if idxf.exists() and part.exists() and part.stat().st_size == total:
+                try:
+                    done_idx = set(json.loads(idxf.read_text()))
+                    ui["append"](f"Докачка: уже готово {len(done_idx)}/{n_chunks} кусков")
+                except Exception:
+                    done_idx = set()
+            else:
+                # Свежий старт — преаллоцируем файл на полный размер.
+                with open(part, "wb") as f:
+                    f.truncate(total)
+                done_idx = set()
+
+            lock = _th.Lock()
+            done_bytes = [min(len(done_idx) * self._DL_CHUNK, total)]
+            init_bytes = done_bytes[0]
+            t0 = time.time()
+            err = [None]
+            tasks = _q.Queue()
+            for i in range(n_chunks):
+                if i not in done_idx:
+                    tasks.put(i)
+
+            def worker():
+                while err[0] is None and not ui["cancel"].is_set():
+                    try:
+                        i = tasks.get_nowait()
+                    except _q.Empty:
+                        return
+                    start = i * self._DL_CHUNK
+                    end = min(start + self._DL_CHUNK, total) - 1
+                    want = end - start + 1
+                    last_e = None
+                    for _attempt in range(3):
+                        if ui["cancel"].is_set():
+                            return
+                        try:
+                            rq = urllib.request.Request(url)
+                            rq.add_header("Range", f"bytes={start}-{end}")
+                            r = urllib.request.urlopen(rq, timeout=30)
+                            data = r.read(); r.close()
+                            if len(data) != want:
+                                raise IOError(f"неполный кусок {len(data)}/{want}")
+                            with open(part, "r+b") as f:
+                                f.seek(start); f.write(data)
+                            last_e = None
+                            break
+                        except Exception as e:
+                            last_e = e
+                            time.sleep(1.0)
+                    if last_e is not None:
+                        err[0] = last_e
+                        return
+                    with lock:
+                        done_idx.add(i)
+                        done_bytes[0] = min(done_bytes[0] + want, total)
+                        try: idxf.write_text(json.dumps(sorted(done_idx)))
+                        except Exception: pass
+                        now = time.time()
+                        spd = (done_bytes[0] - init_bytes) / max(now - t0, 0.01) / 1024 / 1024
+                        ui["progress"](done_bytes[0] / total, done_bytes[0], total, spd)
+
+            threads = [_th.Thread(target=worker, daemon=True) for _ in range(n_conn)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+
+            if ui["cancel"].is_set():
+                ui["done"](False, "Отменено — прогресс сохранён, можно докачать.")
+                return
+            if err[0] is not None:
+                ui["done"](False, f"Ошибка сети: {err[0]} — прогресс сохранён, докачайте.")
+                return
+
+            ui["status"]("Проверка контрольной суммы (SHA256)…")
+            ui["append"]("Скачано, проверяю целостность…")
+            h = hashlib.sha256()
+            with open(part, "rb") as f:
+                for b in iter(lambda: f.read(1048576), b""):
+                    h.update(b)
+            if h.hexdigest() != sha:
+                for p in (part, idxf):
+                    try: p.unlink()
+                    except Exception: pass
+                ui["done"](False, "SHA256 не совпал — файл повреждён. Нажмите «Скачать» ещё раз.")
+                return
+            if dest.exists():
+                dest.unlink()
+            part.rename(dest)
+            try: idxf.unlink()
+            except Exception: pass
+            ui["done"](True, "✓ Контрольная сумма верна.")
+        except Exception as e:
+            ui["done"](False, f"Ошибка загрузки: {e}")
+
+    def _download_single_stream(self, url, sha, dest, part, total, ui):
+        """Запасной путь: один поток с докачкой (если сервер не отдаёт Range)."""
+        import hashlib, urllib.request, time
+        try:
+            resume = part.stat().st_size if part.exists() else 0
+            req = urllib.request.Request(url)
+            if resume:
+                req.add_header("Range", f"bytes={resume}-")
+            resp = urllib.request.urlopen(req, timeout=30)
+            if resume and resp.getcode() != 206:
+                resume = 0
+                try: part.unlink()
+                except Exception: pass
+            if not total:
+                total = int(resp.headers.get("Content-Length") or 0) + resume
+            downloaded = resume
+            t0 = time.time(); last = 0.0
+            with open(part, "ab" if resume else "wb") as f:
+                while True:
+                    if ui["cancel"].is_set():
+                        ui["done"](False, "Отменено — прогресс сохранён, можно докачать.")
+                        return
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    now = time.time()
+                    if now - last > 0.3:
+                        last = now
+                        spd = (downloaded - resume) / max(now - t0, 0.01) / 1024 / 1024
+                        ui["progress"](downloaded / total if total else 0,
+                                       downloaded, total, spd)
+            ui["status"]("Проверка контрольной суммы (SHA256)…")
+            h = hashlib.sha256()
+            with open(part, "rb") as f:
+                for b in iter(lambda: f.read(1048576), b""):
+                    h.update(b)
+            if h.hexdigest() != sha:
+                try: part.unlink()
+                except Exception: pass
+                ui["done"](False, "SHA256 не совпал — файл повреждён. Нажмите «Скачать» ещё раз.")
+                return
+            if dest.exists():
+                dest.unlink()
+            part.rename(dest)
+            ui["done"](True, "✓ Контрольная сумма верна.")
+        except Exception as e:
+            ui["done"](False, f"Ошибка загрузки: {e}")
 
     # ──────────────────────────────────────────────────────────
     #  Выгрузка переписки из ВКонтакте (VK API) прямо из GUI
@@ -2069,6 +2450,11 @@ class App(_BaseApp):
         if self._whisper_installed:
             ctk.CTkLabel(wrow, text="✓ Whisper установлен", font=self._f(11),
                          text_color=T("GREEN")).pack(side="left", padx=(0, 10))
+            ctk.CTkButton(wrow, text="Обновить", width=100, height=28, font=self._f(11),
+                          fg_color=T("ACCENT"), hover_color=T("ACCENT2"),
+                          text_color="white", corner_radius=6,
+                          command=lambda: (close(), self._show_install_dialog())
+                          ).pack(side="left", padx=(0, 6))
             ctk.CTkButton(wrow, text="Удалить", width=100, height=28, font=self._f(11),
                           fg_color=T("MUTED"), hover_color="#AA3333",
                           text_color=T("SUB"), corner_radius=6,

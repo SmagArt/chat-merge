@@ -1,4 +1,4 @@
-# CLAUDE.md — Merge Chat v2.7
+# CLAUDE.md — Merge Chat v2.8
 
 ## Контекст
 Python GUI: объединяет переписки **Telegram** (JSON/HTML), **VK** (HTML-архив + API-JSON через `tools/vk_fetch_history.py`), **Instagram** (JSON), **WhatsApp** (TXT) в TXT/MD. Расшифровывает голосовые через OpenAI Whisper офлайн. GPU-ускорение: NVIDIA CUDA, Apple Silicon MPS.
@@ -18,7 +18,8 @@ GitHub: github.com/SmagArt/chat-merge
 | v2.4   | публичный релиз на GitHub |
 | v2.5   | собран локально 26.04.2026 (UI lift, имена в выводе, пресеты, изоляция Whisper) |
 | v2.6   | VK API-JSON (`vk_export`) внесён в установщик; пересланные разворачиваются |
-| **v2.7** | собран 11.06.2026: кнопка «⬇ Выгрузить из ВК» в GUI + `vk_fetch.bat` + фикс высоты окна/лога; имя установщика без `_admin`. **Текущая** |
+| v2.7   | собран 11.06.2026: кнопка «⬇ Выгрузить из ВК» в GUI + `vk_fetch.bat` + фикс высоты окна/лога; имя установщика без `_admin` |
+| **v2.8** | собран 18.06.2026: управление моделями кнопками (скачать/удалить, отражается на диске), многопоточная загрузка моделей (8 соединений, ~×3), проверка SHA256, статус модели по целостности (не по факту файла), кнопка «Обновить Whisper». **Текущая** |
 | v3.0   | backlog: миграция UI на PySide6 (см. `memory/project_chat_merge_qt_migration.md`) |
 
 **Установщик один** (`installer_windows.iss`, bundled Python, права администратора). Прежнее
@@ -44,6 +45,35 @@ GitHub: github.com/SmagArt/chat-merge
 
 ---
 
+## Фиксы 2026-06-18 (v2.8)
+
+Поводом стал баг, на который наступил Артём: статус модели показывал зелёное «скачана,
+готова», хотя в `whisper_models\` лежал обрубок 58 МБ (недокачанный `medium.pt`). Проверка
+`_model_downloaded` смотрела только наличие `.pt`, не размер → whisper при запуске не сходился
+по SHA256 и молча перекачивал.
+
+- **Статус модели по целостности.** `_model_state()` → `ok | partial | absent` по размеру
+  файла относительно `_MODEL_MIN_BYTES` (~90% реального). Битый файл = `partial`, не «готова».
+- **Кнопки управления моделью** (`_download_selected_model` / `_delete_selected_model`) под
+  селектором. Качают/удаляют физически в `whisper_models\`. Принцип: каждое действие в GUI
+  отражается на диске.
+- **Многопоточная загрузка** (`_download_model_worker`, `_DL_CONNECTIONS = 8`,
+  `_DL_CHUNK = 16 МБ`). Качаем кусками через HTTP Range в 8 потоков — на шейпленном канале к
+  Azure CDN из РФ это ×2–3 к одному потоку (замер: 3.38 → 9.63 МБ/с). Обход VPN НЕ помогает
+  (прямой маршрут к этому хосту режется не слабее); решает именно параллелизм.
+- **Докачка + SHA256.** Индекс готовых кусков в sidecar `<model>.pt.idx`, файл преаллоцируется
+  на полный размер, потоки пишут по своим offset (на Windows — каждый свой handle `r+b`,
+  `pwrite` нет). После загрузки — сверка SHA256 (хеш = предпоследний сегмент URL whisper).
+  `_download_single_stream` — фолбэк, если сервер не отдаёт Range.
+- **«Обновить Whisper»** в «О программе» — переиспользует `_show_install_dialog` (там уже
+  `pip install --upgrade`).
+
+**Урок (не повторять):** «файл существует» ≠ «файл готов». Для скачанных артефактов проверять
+размер/контрольную сумму, а UI-статус обязан отражать физическую реальность, а не факт пути.
+См. `memory/feedback_verify_integrity_not_existence.md`.
+
+---
+
 ## Файлы проекта (актуальный состав)
 
 | Файл | Назначение |
@@ -60,14 +90,14 @@ GitHub: github.com/SmagArt/chat-merge
 | `merge_chat.ico` / `merge_chat.icns` / `merge_chat_1024.png` | Иконки |
 | `requirements.txt` | Зависимости |
 | `python-installer/python-3.13.2-amd64.exe` | Бандл Python для Inno (скачать вручную при сборке на новой машине, см. ниже) |
-| `dist_installer/MergeChat_Setup_v2.7.exe` | Готовый Windows-инсталлятор |
+| `dist_installer/MergeChat_Setup_v2.8.exe` | Готовый Windows-инсталлятор |
 | `README.md` | Документация пользователя |
 
 ---
 
 ## Сборка
 
-### Windows (MergeChat_Setup_v2.7.exe)
+### Windows (MergeChat_Setup_v2.8.exe)
 1. На новой машине — один раз скачать Python-бандл:
    ```
    powershell -Command "Invoke-WebRequest 'https://www.python.org/ftp/python/3.13.2/python-3.13.2-amd64.exe' -OutFile 'python-installer\python-3.13.2-amd64.exe'"
@@ -220,8 +250,8 @@ _subp.run = _run_hidden
 
 ## Pending
 
-- [ ] Mac DMG v2.7 пересобрать на Mac Mini M4 (`bash build_mac.command`)
-- [ ] GitHub Release v2.7 (Windows .exe + Mac .dmg + source)
+- [ ] Mac DMG v2.8 пересобрать на Mac Mini M4 (`bash build_mac.command`)
+- [ ] GitHub Release v2.8 (Windows .exe + Mac .dmg + source)
 - [ ] (backlog v3.0) Миграция UI на PySide6 — см. `memory/project_chat_merge_qt_migration.md`. PyInstaller заодно решит «pythonw.exe в Диспетчере задач».
 
 ---
