@@ -18,6 +18,11 @@ vk_fetch_history.py — выгрузка истории диалогов ВК н
 в URL vk.com/im?sel=<peer_id> или через --list). Для бесед (групповые чаты) peer_id =
 2000000000 + номер чата — тоже виден в --list.
 
+ВАЖНО (18.08.2026): запросы идут НАПРЯМУЮ, мимо прокси (Karing) — сессия с
+trust_env=False. С VPN-IP массовые API-запросы Kate-токена ВК считает взломом
+аккаунта и блокирует профиль. Прокси вернуть: VK_USE_PROXY=1. Темп — VK_REQUEST_PAUSE
+(по умолчанию 0.8с). После выгрузки токен лучше отзывать: vk.com → Безопасность → Сеансы.
+
 ВНИМАНИЕ: тянет ВСЕ диалоги обычного VK-мессенджера. Не запускать в автозапуске —
 выгрузка тяжёлая (история всех чатов), гонять руками по необходимости.
 """
@@ -44,6 +49,21 @@ API = "https://api.vk.com/method"
 V = "5.199"
 OUT_DIR = Path(__file__).parent / "vk_export"
 
+# Пауза между запросами. 0.35с (формальный лимит VK 3 rps) ровным потоком на тысячах
+# сообщений читается антифродом ВК как бот — в августе 2026 профиль за это блокировали
+# трижды. Переопределяется VK_REQUEST_PAUSE.
+PAUSE = float(os.environ.get("VK_REQUEST_PAUSE", "0.8"))
+
+# Сессия ИГНОРИРУЕТ HTTP(S)_PROXY из окружения: api.vk.com должен идти напрямую,
+# мимо Karing. В режиме Global весь трафик уходит в туннель, и ВК видит сотни
+# API-запросов Kate-клиента с датацентрового IP → «доступ к аккаунту у третьей стороны».
+# Вернуть прокси принудительно: VK_USE_PROXY=1.
+_USE_PROXY = os.environ.get("VK_USE_PROXY", "").strip() in ("1", "true", "yes")
+SESSION = requests.Session()
+SESSION.trust_env = _USE_PROXY
+if not _USE_PROXY:
+    SESSION.proxies = {}
+
 
 def vk(method: str, token: str, **params) -> dict:
     params.update({"access_token": token, "v": V})
@@ -51,7 +71,7 @@ def vk(method: str, token: str, **params) -> dict:
     last_exc = None
     for attempt in range(6):
         try:
-            r = requests.get(f"{API}/{method}", params=params, timeout=30)
+            r = SESSION.get(f"{API}/{method}", params=params, timeout=30)
             data = r.json()
         except (requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError) as e:
@@ -84,7 +104,7 @@ def fetch_all_conversations(token: str) -> list[dict]:
         if len(conversations) >= resp["count"]:
             break
         offset += 200
-        time.sleep(0.35)
+        time.sleep(PAUSE)
     return conversations
 
 
@@ -114,7 +134,7 @@ def fetch_messages(peer_id: int, token: str) -> tuple[list[dict], dict]:
         if len(messages) >= resp["count"]:
             break
         offset += 200
-        time.sleep(0.35)
+        time.sleep(PAUSE)
     return list(reversed(messages)), names
 
 
