@@ -75,7 +75,7 @@ _MODEL_MIN_BYTES = {"tiny": 65_000_000, "base": 125_000_000,
 # совпасть с тем, как whisper.load_model сам кладёт файл (для «large» это
 # large-v3.pt) — иначе whisper не найдёт нашу копию и полезет качать заново.
 _WHISPER_URLS = {
-    "tiny":   "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e/tiny.pt",
+    "tiny":   "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt",
     "base":   "https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt",
     "small":  "https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt",
     "medium": "https://openaipublic.azureedge.net/main/whisper/models/345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1/medium.pt",
@@ -2542,6 +2542,26 @@ class App(_BaseApp):
         if not SCRIPT:
             from tkinter import messagebox
             messagebox.showerror("Merge Chat", "Не найден merge_chat.py рядом с программой.")
+            return
+
+        # Модель должна быть скачана ЗАРАНЕЕ нашим многопоточным загрузчиком.
+        # Иначе whisper.load_model полезет качать сам: один поток, без докачки —
+        # каждый перезапуск начинает с нуля. Это и есть «качает вечно».
+        if _WHISPER_OK and not self._model_downloaded(self.model_var.get()):
+            from tkinter import messagebox
+            m = self.model_var.get()
+            st = self._model_state(m)
+            what = ("Модель «%s» скачана не полностью." % m if st == "partial"
+                    else "Модель «%s» ещё не скачана." % m)
+            if messagebox.askyesno(
+                    "Merge Chat",
+                    what + " (%s)\n\n"
+                    "Скачать её сейчас в 8 потоков с докачкой?\n\n"
+                    "Если запустить обработку как есть — whisper будет тянуть "
+                    "модель сам, в один поток и без докачки: медленно, а при "
+                    "закрытии программы прогресс теряется целиком."
+                    % _MODEL_SIZE.get(m, "")):
+                self._download_selected_model()
             return
 
         self._save_cfg()
