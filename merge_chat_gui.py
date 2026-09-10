@@ -162,7 +162,7 @@ def _has_nvidia():
             ["powershell", "-NoProfile", "-Command",
              "(Get-CimInstance Win32_VideoController).Name"],
             creationflags=0x08000000, stderr=subprocess.DEVNULL,
-            text=True, timeout=10)
+            text=True, encoding="utf-8", errors="replace", timeout=10)
         if "nvidia" in out.lower():
             return True
     except Exception:
@@ -212,17 +212,15 @@ class App(_BaseApp):
         # Стартовая высота — компактно умещается на 1920×1080. Лог растягивается
         # вверх до доступной высоты, юзер тянет окно для большего лога.
         H_target = 960 if _WHISPER_OK else 1020
-        sw = self.winfo_screenwidth()
         # Считаем геометрию от РАБОЧЕЙ области (экран минус панель задач), а не
         # от полного экрана — иначе окно с кнопкой «Запустить» уезжает под таскбар.
         wa_w, wa_h = self._work_area()
         self._H_target = H_target
-        # ~56px запас на заголовок окна и рамку, чтобы всё окно влезло целиком
-        H = min(H_target, wa_h - 56)
         W = min(W, wa_w - 40)
-        y = max(0, (wa_h - H - 40) // 2)
         self.configure(fg_color=T("BG"))
-        self.geometry(f"{W}x{H}+{(sw-W)//2}+{y}")
+        # Размер и позиция считаются вместе: сначала обрезаем высоту по рабочей
+        # области, и только потом центрируем — иначе окно уезжает под панель задач.
+        self._place_in_work_area(W, H_target)
 
         # Иконка сразу — ctypes Load/Send отложим на after(300)
         if IS_WIN:
@@ -264,8 +262,9 @@ class App(_BaseApp):
         # Тяжёлую сборку откладываем — mainloop отрисует splash и вызовет callback
         self.after(10, self._deferred_init)
 
-    def _work_area(self):
-        """(width, height) рабочей области экрана — без панели задач Windows."""
+    def _work_area_rect(self):
+        """(left, top, right, bottom) рабочей области — экран без панели задач.
+        Панель может стоять не только снизу, поэтому left/top тоже важны."""
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         if IS_WIN:
             try:
@@ -275,13 +274,59 @@ class App(_BaseApp):
                 # SPI_GETWORKAREA = 0x0030 → прямоугольник без панели задач
                 if ctypes.windll.user32.SystemParametersInfoW(
                         0x0030, 0, ctypes.byref(rect), 0):
-                    w = rect.right - rect.left
-                    h = rect.bottom - rect.top
-                    if w > 0 and h > 0:
-                        return w, h
+                    if rect.right > rect.left and rect.bottom > rect.top:
+                        return rect.left, rect.top, rect.right, rect.bottom
             except Exception:
                 pass
-        return sw, sh
+        return 0, 0, sw, sh
+
+    def _work_area(self):
+        """(width, height) рабочей области экрана — без панели задач Windows."""
+        l, t, r, b = self._work_area_rect()
+        return r - l, b - t
+
+    # Запас на рамку окна и заголовок, пока окно ещё не создано и померить нечем.
+    _CHROME_FALLBACK = 56
+
+    def _chrome_h(self):
+        """Сколько пикселей окно занимает СВЕРХ клиентской области: заголовок +
+        рамка. Меряем по факту — на разных темах и масштабах это разное число.
+        Tk-геометрия задаёт клиентскую высоту, а под панель задач уезжает рамка,
+        поэтому без этой поправки окно всегда вылезает вниз."""
+        if not IS_WIN:
+            return self._CHROME_FALLBACK
+        try:
+            import ctypes
+            from ctypes import wintypes
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+            fr = wintypes.RECT()
+            if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(fr)):
+                ch = (fr.bottom - fr.top) - self.winfo_height()
+                if 0 <= ch < 200:
+                    return ch
+        except Exception:
+            pass
+        return self._CHROME_FALLBACK
+
+    def _place_in_work_area(self, w, h, x=None, y=None):
+        """Поставить окно размером w×h (клиентская область) так, чтобы вся рамка
+        целиком лежала в рабочей области. Высота при необходимости урезается,
+        позиция — прижимается. Возвращает фактические (w, h)."""
+        l, t, r, b = self._work_area_rect()
+        chrome = self._chrome_h()
+        w = max(1, min(w, r - l))
+        h = max(1, min(h, (b - t) - chrome))
+        if x is None:
+            x = l + ((r - l) - w) // 2
+        if y is None:
+            y = t + ((b - t) - (h + chrome)) // 2
+        # Прижимаем: сначала не даём вылезти вправо/вниз, потом — влево/вверх.
+        x = min(x, r - w)
+        y = min(y, b - h - chrome)
+        x = max(x, l)
+        y = max(y, t)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        return w, h
 
     def _deferred_init(self):
         self._build()
@@ -295,7 +340,7 @@ class App(_BaseApp):
         # Так нижняя панель «Запустить» никогда не срезается, а лог не схлопывается.
         LOG_FLOOR = 140
         try:
-            avail_h = self._work_area()[1] - 56
+            avail_h = self._work_area()[1] - self._chrome_h()
             req = self.winfo_reqheight()
             if req > avail_h:
                 over = req - avail_h
@@ -305,11 +350,10 @@ class App(_BaseApp):
                 req = self.winfo_reqheight()
             H = min(req, avail_h)
             cur_w = max(self.winfo_width(), 900)
-            x, y = self.winfo_x(), self.winfo_y()
-            # не даём окну уехать под верх экрана при росте высоты
-            if y < 0:
-                y = 0
-            self.geometry(f"{cur_w}x{H}+{x}+{y}")
+            # Позицию НЕ переиспользуем: она была посчитана под старую, меньшую
+            # высоту. Окно подросло → низ с кнопкой «Запустить» уезжал под
+            # панель задач. Пересчитываем и прижимаем к рабочей области.
+            self._place_in_work_area(cur_w, H)
         except Exception:
             pass
         try:
@@ -2067,10 +2111,14 @@ class App(_BaseApp):
 
                 def run_pip(args, label):
                     self.after(0, plbl.configure, {"text": label})
+                    # encoding/errors ОБЯЗАТЕЛЬНЫ: без них text=True берёт кодировку
+                    # локали (на русской Windows cp1251), а pip пишет UTF-8. Байт
+                    # 0x98 в cp1251 не определён -> UnicodeDecodeError прямо в цикле
+                    # чтения, поток установки умирает молча и окно висит навсегда.
                     proc = subprocess.Popen(
                         [sys.executable, "-m", "pip", "install"] + base_args + args,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, **kw)
+                        text=True, encoding="utf-8", errors="replace", **kw)
                     for line in proc.stdout:
                         line = line.rstrip()
                         if line:
