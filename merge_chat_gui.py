@@ -120,6 +120,11 @@ DL_CONNECTIONS = 8
 DL_CHUNK = 8 * 1024 * 1024       # кусок под одно Range-соединение
 DL_READ = 256 * 1024             # шаг чтения внутри куска — ради плавного %
 DL_RETRIES = 4
+# Cloudflare (а на нём живёт зеркало download-r2.pytorch.org, куда pip уводит
+# torch) отдаёт 403 на дефолтный "Python-urllib/3.x". Проверено: тот же URL с
+# обычным UA возвращает 206. Поэтому UA ставим на КАЖДЫЙ запрос загрузчика.
+DL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+         "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 
 class DLItem:
@@ -187,7 +192,7 @@ def _dl_probe(url, timeout=30):
     """(total_bytes, поддержан_ли_Range). Range-проб 0-0 дешевле HEAD и
     заодно проверяет, что сервер реально умеет докачку."""
     import urllib.request
-    rq = urllib.request.Request(url)
+    rq = urllib.request.Request(url, headers={"User-Agent": DL_UA})
     rq.add_header("Range", "bytes=0-0")
     r = urllib.request.urlopen(rq, timeout=timeout)
     try:
@@ -307,7 +312,8 @@ def dl_fetch(item, cancel, on_bytes, on_log, conns=DL_CONNECTIONS,
                     return
                 got = 0
                 try:
-                    rq = urllib.request.Request(item.url)
+                    rq = urllib.request.Request(
+                        item.url, headers={"User-Agent": DL_UA})
                     if ranges:
                         rq.add_header("Range", f"bytes={start}-{end}")
                     r = urllib.request.urlopen(rq, timeout=30)
@@ -413,8 +419,12 @@ def dl_fetch_all(items, cancel, ui):
                 return "cancelled"
             try:
                 it.size = _dl_probe(it.url)[0]
-            except Exception:
+            except Exception as e:
+                # Молча обнулять нельзя: «Всего» тогда считается без этого
+                # файла и показывает 85% там, где скачано 3%. Так и вышло с
+                # torch (2.5 ГБ), которого Cloudflare отдавал 403.
                 it.size = 0
+                ui["append"](f"размер {it.label} узнать не вышло: {e}")
 
     grand_total = sum(it.size or 0 for it in items)
     grand_done = [0]
@@ -471,7 +481,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.9"
+VERSION = "2.9.1"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -574,6 +584,14 @@ class App(_BaseApp):
         self._H_target = H_target
         W = min(W, wa_w - 40)
         self.configure(fg_color=T("BG"))
+        # Окно прячем до окончательной геометрии. Иначе видно всю кухню:
+        # сначала пустой прямоугольник 960px со splash, потом прыжок размера и
+        # позиции после _build. Пользователь читает этот прыжок как «моргнуло».
+        # Показываем в _deferred_init, уже посчитанным и на месте.
+        try:
+            self.withdraw()
+        except Exception:
+            pass
         # Размер и позиция считаются вместе: сначала обрезаем высоту по рабочей
         # области, и только потом центрируем — иначе окно уезжает под панель задач.
         self._place_in_work_area(W, H_target)
@@ -710,6 +728,13 @@ class App(_BaseApp):
             # высоту. Окно подросло → низ с кнопкой «Запустить» уезжал под
             # панель задач. Пересчитываем и прижимаем к рабочей области.
             self._place_in_work_area(cur_w, H)
+        except Exception:
+            pass
+        # Геометрия окончательная — показываем. Вне try: даже если расчёт
+        # выше упал, окно обязано появиться, иначе прога «не запустилась».
+        try:
+            self.deiconify()
+            self.lift()
         except Exception:
             pass
         try:
@@ -1916,7 +1941,7 @@ class App(_BaseApp):
         (24 колеса) и лишняя для одной модели.
         """
         overlay, content, raw_close = self._overlay(title, width=580,
-                                                    height=420 if multi else 380)
+                                                    height=470 if multi else 420)
         # Панель закрыли — виджетов больше нет, а поток загрузки про это не
         # знает и продолжает слать сюда прогресс. Без флага каждый такой вызов
         # это TclError «invalid command name» в консоль. Заодно закрытие панели
@@ -1928,9 +1953,11 @@ class App(_BaseApp):
             cancel.set()
             raw_close()
 
+        # Подзаголовок по левому краю — как и всё содержимое ниже. Раньше он
+        # был центрирован и висел «не от той сетки».
         ctk.CTkLabel(content, text=subtitle, font=self._f(11),
-                     text_color=T("SUB"), justify="center",
-                     wraplength=520).pack(pady=(2, 12))
+                     text_color=T("SUB"), justify="left", anchor="w",
+                     wraplength=520).pack(fill="x", pady=(2, 14))
 
         # ── текущий файл ──
         cur_lbl = ctk.CTkLabel(content, text="Подключение…", font=self._f(12, "bold"),
@@ -1940,9 +1967,12 @@ class App(_BaseApp):
                                  progress_color=T("ACCENT"), corner_radius=3)
         bar.pack(fill="x", pady=(4, 2))
         bar.set(0)
+        # wraplength обязателен: сюда попадает и текст ошибки, а он длиннее
+        # панели и без переноса просто обрезался на полуслове.
         stat_lbl = ctk.CTkLabel(content, text="", font=self._mono(11),
-                                text_color=T("SUB"), anchor="w")
-        stat_lbl.pack(fill="x")
+                                text_color=T("SUB"), anchor="w",
+                                justify="left", wraplength=520)
+        stat_lbl.pack(fill="x", pady=(2, 0))
 
         # ── общий прогресс (только для многофайловых загрузок) ──
         gbar = gstat = None
@@ -1955,19 +1985,26 @@ class App(_BaseApp):
                                  text_color=T("SUB"), anchor="w")
             gstat.pack(fill="x")
 
-        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
-                                 text_color=T("TEXT"), height=140, corner_radius=8,
-                                 border_color=T("BORDER"), border_width=1)
-        log_box.pack(fill="both", expand=True, pady=(10, 8))
-        log_box.configure(state="disabled")
-
+        # Кнопка одна на всю панель — значит по центру. Прижатая вправо
+        # читается как «есть ещё вторая, но её забыли».
+        # Пакуем ЕЁ ПЕРВОЙ и к нижнему краю: строка статуса переносится на две
+        # строки, когда туда попадает текст ошибки, и при обычном порядке
+        # упаковки кнопку выдавливало за нижнюю границу панели (проверено).
+        # Теперь лишнюю высоту забирает лог — он единственный с expand=True.
         bf = ctk.CTkFrame(content, fg_color="transparent")
-        bf.pack(fill="x")
-        btn = ctk.CTkButton(bf, text="Отмена", width=130, height=36,
-                            font=self._f(12), fg_color=T("SURFACE"),
+        bf.pack(side="bottom", fill="x", pady=(10, 0))
+        btn = ctk.CTkButton(bf, text="Отмена", width=160, height=38,
+                            font=self._f(12, "bold"), fg_color=T("SURFACE"),
                             hover_color="#882828", text_color=T("SUB"),
+                            border_width=1, border_color=T("BORDER"),
                             corner_radius=8, command=cancel.set)
-        btn.pack(side="right")
+        btn.pack()
+
+        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
+                                 text_color=T("TEXT"), height=120, corner_radius=8,
+                                 border_color=T("BORDER"), border_width=1)
+        log_box.pack(fill="both", expand=True, pady=(12, 0))
+        log_box.configure(state="disabled")
 
         def _append(line):
             log_box.configure(state="normal")
@@ -2003,7 +2040,8 @@ class App(_BaseApp):
                 cur_lbl.configure(text="Не завершено", text_color="#E8944A")
                 stat_lbl.configure(text=msg, text_color="#E8944A")
             btn.configure(text="Закрыть", fg_color=T("SURFACE"),
-                          hover_color=T("BORDER"), command=close)
+                          hover_color=T("BORDER"), text_color=T("TEXT"),
+                          command=close)
 
         def _guard(fn):
             """Вызвать в main-thread и промолчать, если панель уже закрыта."""
