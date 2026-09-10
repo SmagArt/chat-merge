@@ -94,7 +94,11 @@ Type: filesandordirs; Name: "{app}"
 // Предлагаем дочистить — но только по явному согласию и списком: эти же
 // пакеты мог поставить себе кто-то другой.
 const
-  LEGACY_PKGS = 'customtkinter tkinterdnd2 imageio-ffmpeg beautifulsoup4 openai-whisper torch';
+  // customtkinter и beautifulsoup4 сюда НЕ входят намеренно: это ходовые
+  // библиотеки, на которых легко сидит чужой скрипт того же пользователя
+  // (проверено — сидит). Убираем только тяжёлое и профильное, что кроме
+  // Merge Chat в системный Python ставить было некому.
+  LEGACY_PKGS = 'openai-whisper torch tkinterdnd2 imageio-ffmpeg';
 
 function GetRecordedPython(): String;
 var
@@ -127,10 +131,12 @@ begin
   if MsgBox('Удалить также пакеты, которые прошлые версии Merge Chat'#13#10 +
             'поставили в системный Python?'#13#10#13#10 +
             Py + #13#10#13#10 +
-            'Будут удалены: customtkinter, tkinterdnd2, imageio-ffmpeg,'#13#10 +
-            'beautifulsoup4, openai-whisper, torch.'#13#10#13#10 +
-            'Нажмите «Нет», если этими пакетами пользуется что-то ещё —'#13#10 +
-            'сама Merge Chat их больше не использует, всё её хозяйство'#13#10 +
+            'Будут удалены: openai-whisper, torch, tkinterdnd2,'#13#10 +
+            'imageio-ffmpeg. Это гигабайты.'#13#10#13#10 +
+            'customtkinter и beautifulsoup4 НЕ трогаем — на них может'#13#10 +
+            'держаться другой ваш скрипт.'#13#10#13#10 +
+            'Нажмите «Нет», если этими пакетами пользуется что-то ещё.'#13#10 +
+            'Сама Merge Chat их больше не использует: всё её хозяйство'#13#10 +
             'лежит внутри папки установки и удаляется в любом случае.',
             mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
   begin
