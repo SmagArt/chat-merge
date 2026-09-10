@@ -60,15 +60,16 @@ def _whisper_available() -> bool:
 
 _WHISPER_OK = _whisper_available()
 
-# Размер каждой модели — для подсказки «докачается ~X» в статусе модели.
-_MODEL_SIZE = {"tiny": "75 МБ", "base": "145 МБ", "small": "480 МБ",
-               "medium": "1.5 ГБ", "large": "2.9 ГБ"}
-# Минимальный «здоровый» размер .pt в байтах (~90% от реального). Файл меньше
-# этого порога = недокачанный/битый: whisper при запуске не сойдётся по SHA256
-# и молча перекачает. Проверяем тут, чтобы не показывать ложное «готова».
-_MODEL_MIN_BYTES = {"tiny": 65_000_000, "base": 125_000_000,
-                    "small": 430_000_000, "medium": 1_350_000_000,
-                    "large": 2_750_000_000}
+# Точные размеры .pt на CDN — ОДИН источник правды. Из них выводятся и
+# подпись на кнопке, и порог «докачано ли». Раньше это были три отдельных
+# списка руками, и подпись «75 МБ» расходилась с полоской, которая считала
+# те же байты по-своему.
+_MODEL_BYTES = {"tiny": 75_572_083, "base": 145_262_807, "small": 483_617_219,
+                "medium": 1_528_008_539, "large": 3_087_371_615}
+# Файл меньше 90% от точного размера = недокачанный или битый: whisper при
+# запуске не сойдётся по SHA256 и молча перекачает. Проверяем тут, чтобы не
+# показывать ложное «готова».
+_MODEL_MIN_BYTES = {m: int(b * 0.9) for m, b in _MODEL_BYTES.items()}
 
 # Официальные URL моделей OpenAI Whisper. SHA256 модели = предпоследний сегмент
 # пути URL (whisper так и хранит). Имя сохраняемого файла = basename URL, чтобы
@@ -88,6 +89,348 @@ def _model_url_parts(m: str):
     sha = url.rsplit("/", 2)[-2]
     dest = WHISPER_MODELS / url.rsplit("/", 1)[-1]
     return url, sha, dest
+
+# ──────────────────────────────────────────────────────────────────────
+#  Единый загрузчик файлов — ОДИН на всё, что прога тянет из сети:
+#  модели Whisper (.pt) и колёса движка (torch/whisper .whl).
+#  Раньше это были два разных механизма с двумя индикаторами: у модели —
+#  полоска с мегабайтами, у движка — бегунок вообще без процентов (pip в
+#  пайп процентов не отдаёт). Теперь всё качается здесь, и панель одна.
+#
+#  Почему многопоточно: одно HTTPS-соединение к CDN из РФ шейпится,
+#  8 параллельных Range-запросов складывают скорость (замер: 1.2 МБ/с
+#  в один поток против 22 МБ/с в восемь). Докачка — через sidecar .idx
+#  с индексом готовых кусков, поэтому обрыв не стоит почти ничего.
+# ──────────────────────────────────────────────────────────────────────
+
+DL_CONNECTIONS = 8
+DL_CHUNK = 8 * 1024 * 1024       # кусок под одно Range-соединение
+DL_READ = 256 * 1024             # шаг чтения внутри куска — ради плавного %
+DL_RETRIES = 4
+
+
+class DLItem:
+    """Один файл к загрузке. size/sha необязательны: size узнаём пробой,
+    sha проверяем только если задан (у моделей он в URL, у колёс нет)."""
+    __slots__ = ("url", "dest", "sha", "label", "size")
+
+    def __init__(self, url, dest, sha=None, label=None, size=None):
+        self.url = url
+        self.dest = Path(dest)
+        self.sha = sha
+        self.label = label or self.dest.name
+        self.size = size
+
+
+def _fmt_mb(n):
+    """Байты → «75 МБ» / «1.53 ГБ». Десятичные, как размеры пишут везде:
+    в кнопках моделей, на сайте PyPI и в самом pip. Двоичные МиБ дали бы
+    «72 МБ» там, где кнопка обещает 75 — пользователь решит, что недокачано."""
+    if not n or n < 0:
+        return "0 МБ"
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f} ГБ"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.0f} МБ"
+    return f"{n / 1000:.0f} КБ"
+
+
+def _fmt_speed(bps):
+    return f"{bps / 1_000_000:.1f} МБ/с" if bps and bps > 0 else "—"
+
+
+# Подписи размеров моделей — тем же форматтером, что и полоска загрузки,
+# иначе кнопка обещает одно, а прогресс показывает другое.
+_MODEL_SIZE = {m: _fmt_mb(b) for m, b in _MODEL_BYTES.items()}
+
+
+def _plural(n, forms):
+    """n + правильная форма: (файл, файла, файлов). Без этого в интерфейсе
+    вылезает «24 файлов» и «24 пакетов»."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        f = forms[0]
+    elif 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        f = forms[1]
+    else:
+        f = forms[2]
+    return f"{n} {f}"
+
+
+def _fmt_eta(sec):
+    """Секунды → «0:38» / «1:02:15». Мусор и бесконечность → «—»."""
+    try:
+        sec = int(sec)
+    except Exception:
+        return "—"
+    if sec < 0 or sec > 86400 * 7:
+        return "—"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _dl_probe(url, timeout=30):
+    """(total_bytes, поддержан_ли_Range). Range-проб 0-0 дешевле HEAD и
+    заодно проверяет, что сервер реально умеет докачку."""
+    import urllib.request
+    rq = urllib.request.Request(url)
+    rq.add_header("Range", "bytes=0-0")
+    r = urllib.request.urlopen(rq, timeout=timeout)
+    try:
+        cr = r.headers.get("Content-Range", "")
+        code = r.getcode()
+        cl = r.headers.get("Content-Length")
+    finally:
+        r.close()
+    if code == 206 and "/" in cr:
+        return int(cr.rsplit("/", 1)[-1]), True
+    return int(cl or 0), False
+
+
+class _Cancelled(Exception):
+    """Отмена изнутри чтения — не ошибка сети, повторять не надо."""
+
+
+def dl_fetch(item, cancel, on_bytes, on_log, conns=DL_CONNECTIONS,
+             chunk=DL_CHUNK):
+    """Скачать один DLItem. Возвращает None при успехе, 'cancelled' при
+    отмене, иначе текст ошибки.
+
+    on_bytes(done, total) — абсолютные байты по файлу, зовётся часто
+    (каждые ~256 КБ), чтобы процент двигался плавно, а не рывками по куску.
+    on_log(str) — строка в лог панели.
+    """
+    import hashlib, urllib.request, time, json
+    import threading as _th, queue as _q
+
+    dest = item.dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    idxf = dest.with_name(dest.name + ".idx")
+
+    try:
+        total, ranges = _dl_probe(item.url)
+    except Exception as e:
+        return f"не удалось открыть {item.label}: {e}"
+    if total <= 0:
+        return f"сервер не сообщил размер {item.label}"
+    item.size = total
+
+    # Файл уже на месте и нужного размера — качать нечего.
+    if dest.exists() and dest.stat().st_size == total:
+        on_bytes(total, total)
+        return None
+
+    n_chunks = (total + chunk - 1) // chunk
+
+    def _chunk_len(i):
+        """Последний кусок короче остальных. Считать его полным было
+        ошибкой: на докачке прогресс уезжал вперёд реальности."""
+        return min(chunk, total - i * chunk)
+
+    # Докачка: индекс валиден, только если .part уже нужного размера.
+    done_idx = set()
+    if ranges and idxf.exists() and part.exists() and part.stat().st_size == total:
+        try:
+            done_idx = {i for i in json.loads(idxf.read_text())
+                        if 0 <= i < n_chunks}
+        except Exception:
+            done_idx = set()
+    if not done_idx:
+        try:
+            with open(part, "wb") as f:
+                f.truncate(total)
+        except Exception as e:
+            return f"не удалось создать {part.name}: {e}"
+
+    if not ranges:
+        on_log(f"{item.label}: сервер без Range — качаю в один поток")
+        n_chunks, conns = 1, 1
+        done_idx = set()
+
+    committed = [sum(_chunk_len(i) for i in done_idx)]   # целиком готовые куски
+    live = [0]                                           # принято в текущих кусках
+    if done_idx:
+        on_log(f"Докачка {item.label}: готово {_fmt_mb(committed[0])} "
+               f"из {_fmt_mb(total)}")
+
+    lock = _th.Lock()
+    err = [None]
+    last_ui = [0.0]
+    tasks = _q.Queue()
+    for i in range(n_chunks):
+        if i not in done_idx:
+            tasks.put(i)
+
+    shown = [committed[0]]   # то, что уже показали пользователю
+
+    def _tick(force=False):
+        now = time.time()
+        if force or now - last_ui[0] >= 0.2:
+            last_ui[0] = now
+            # Полоска не должна ехать назад. При обрыве куска мы честно
+            # откатываем счётчик (иначе повтор посчитает те же байты дважды),
+            # но показывать откат нельзя — пользователь читает это как сбой.
+            # Держим достигнутый максимум, пока загрузка его не догонит.
+            val = min(committed[0] + live[0], total)
+            shown[0] = max(shown[0], val)
+            on_bytes(shown[0], total)
+
+    on_bytes(committed[0], total)
+
+    def worker():
+        while err[0] is None and not cancel.is_set():
+            try:
+                i = tasks.get_nowait()
+            except _q.Empty:
+                return
+            start = i * chunk
+            want = _chunk_len(i)
+            end = start + want - 1
+            last_e = None
+            for attempt in range(DL_RETRIES):
+                if cancel.is_set():
+                    return
+                got = 0
+                try:
+                    rq = urllib.request.Request(item.url)
+                    if ranges:
+                        rq.add_header("Range", f"bytes={start}-{end}")
+                    r = urllib.request.urlopen(rq, timeout=30)
+                    try:
+                        buf = bytearray()
+                        while len(buf) < want:
+                            if cancel.is_set():
+                                raise _Cancelled()
+                            b = r.read(min(DL_READ, want - len(buf)))
+                            if not b:
+                                break
+                            buf += b
+                            got += len(b)
+                            with lock:
+                                live[0] += len(b)
+                            _tick()
+                    finally:
+                        r.close()
+                    if len(buf) != want:
+                        raise IOError(f"неполный кусок {len(buf)}/{want}")
+                    with open(part, "r+b") as f:
+                        f.seek(start)
+                        f.write(buf)
+                    with lock:
+                        live[0] -= got          # переносим из «в пути» в «готово»
+                        committed[0] += want
+                        done_idx.add(i)
+                        try:
+                            idxf.write_text(json.dumps(sorted(done_idx)))
+                        except Exception:
+                            pass
+                    _tick(force=True)
+                    last_e = None
+                    break
+                except _Cancelled:
+                    with lock:
+                        live[0] -= got
+                    return
+                except Exception as e:
+                    # Откатываем недосчитанное этой попыткой, иначе повтор
+                    # посчитает те же байты второй раз и процент перевалит 100.
+                    with lock:
+                        live[0] -= got
+                    last_e = e
+                    if attempt < DL_RETRIES - 1:
+                        time.sleep(1.5 * (attempt + 1))
+            if last_e is not None:
+                err[0] = last_e
+                return
+
+    threads = [_th.Thread(target=worker, daemon=True)
+               for _ in range(max(1, min(conns, n_chunks)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    if cancel.is_set():
+        return "cancelled"
+    if err[0] is not None:
+        return f"{item.label}: {err[0]}"
+
+    if item.sha:
+        on_log(f"Проверяю контрольную сумму {item.label}…")
+        h = hashlib.sha256()
+        with open(part, "rb") as f:
+            for b in iter(lambda: f.read(1048576), b""):
+                h.update(b)
+        if h.hexdigest() != item.sha:
+            for p in (part, idxf):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            return f"{item.label}: SHA256 не совпал, файл повреждён"
+
+    try:
+        if dest.exists():
+            dest.unlink()
+        part.replace(dest)
+    except Exception as e:
+        return f"{item.label}: не удалось сохранить: {e}"
+    try:
+        idxf.unlink()
+    except Exception:
+        pass
+    on_bytes(total, total)
+    return None
+
+
+def dl_fetch_all(items, cancel, ui):
+    """Скачать список DLItem с общим прогрессом. ui — словарь из _dl_panel.
+    Возвращает None при успехе, 'cancelled' при отмене, иначе текст ошибки."""
+    import time
+
+    # Размеры узнаём заранее — иначе общий процент не с чем сравнивать.
+    unknown = [it for it in items if not it.size]
+    if unknown:
+        ui["status"]("Уточняю размеры: "
+                     + _plural(len(unknown), ("файл", "файла", "файлов")) + "…")
+        for it in unknown:
+            if cancel.is_set():
+                return "cancelled"
+            try:
+                it.size = _dl_probe(it.url)[0]
+            except Exception:
+                it.size = 0
+
+    grand_total = sum(it.size or 0 for it in items)
+    grand_done = [0]
+
+    for n, it in enumerate(items, 1):
+        if cancel.is_set():
+            return "cancelled"
+        ui["item"](n, len(items), it.label)
+        t0 = time.time()
+        start_grand = grand_done[0]
+        seen = [0]
+
+        def on_bytes(done, total, _seen=seen, _t0=t0, _sg=start_grand):
+            grand_done[0] += done - _seen[0]
+            _seen[0] = done
+            el = time.time() - _t0
+            # Скорость — по этому файлу, с начала его загрузки. Первые
+            # 0.3 с не показываем: там она скачет от нуля до сотен.
+            spd = (grand_done[0] - _sg) / el if el > 0.3 else 0
+            left = ((grand_total - grand_done[0]) / spd) if spd > 0 else None
+            ui["progress"](done, total, grand_done[0], grand_total, spd, left)
+
+        err = dl_fetch(it, cancel, on_bytes, ui["append"])
+        if err:
+            return err
+        # Размер мог уточниться по факту — добираем разницу в общий счётчик.
+        if it.size and seen[0] < it.size:
+            grand_done[0] += it.size - seen[0]
+    return None
 
 # ВСЕГДА ctk.CTk - DnD инжектируется через _require() после создания окна
 _BaseApp = ctk.CTk
@@ -1546,260 +1889,162 @@ class App(_BaseApp):
                       hover_color=T("ACCENT2"), corner_radius=8,
                       command=close).pack()
 
+    # ──────────────────────────────────────────────────────────
+    #  Единая панель загрузки — одна на модели и на движок Whisper
+    # ──────────────────────────────────────────────────────────
+    def _dl_panel(self, title, subtitle, cancel, multi=False):
+        """Панель прогресса. Возвращает (ui, finish).
+
+        ui  — словарь колбэков для dl_fetch_all (все переводят вызов в
+              main-thread через after, воркер живёт в отдельном потоке).
+        finish(ok, msg) — закрывающий вызов, красит панель и меняет кнопку.
+
+        multi=True добавляет вторую полоску «Всего» — она нужна движку
+        (24 колеса) и лишняя для одной модели.
+        """
+        overlay, content, raw_close = self._overlay(title, width=580,
+                                                    height=420 if multi else 380)
+        # Панель закрыли — виджетов больше нет, а поток загрузки про это не
+        # знает и продолжает слать сюда прогресс. Без флага каждый такой вызов
+        # это TclError «invalid command name» в консоль. Заодно закрытие панели
+        # означает отмену: качать в никуда смысла нет.
+        alive = [True]
+
+        def close():
+            alive[0] = False
+            cancel.set()
+            raw_close()
+
+        ctk.CTkLabel(content, text=subtitle, font=self._f(11),
+                     text_color=T("SUB"), justify="center",
+                     wraplength=520).pack(pady=(2, 12))
+
+        # ── текущий файл ──
+        cur_lbl = ctk.CTkLabel(content, text="Подключение…", font=self._f(12, "bold"),
+                               text_color=T("TEXT"), anchor="w")
+        cur_lbl.pack(fill="x")
+        bar = ctk.CTkProgressBar(content, height=10, fg_color=T("SURFACE"),
+                                 progress_color=T("ACCENT"), corner_radius=3)
+        bar.pack(fill="x", pady=(4, 2))
+        bar.set(0)
+        stat_lbl = ctk.CTkLabel(content, text="", font=self._mono(11),
+                                text_color=T("SUB"), anchor="w")
+        stat_lbl.pack(fill="x")
+
+        # ── общий прогресс (только для многофайловых загрузок) ──
+        gbar = gstat = None
+        if multi:
+            gbar = ctk.CTkProgressBar(content, height=6, fg_color=T("SURFACE"),
+                                      progress_color=T("GREEN"), corner_radius=2)
+            gbar.pack(fill="x", pady=(12, 2))
+            gbar.set(0)
+            gstat = ctk.CTkLabel(content, text="", font=self._mono(11),
+                                 text_color=T("SUB"), anchor="w")
+            gstat.pack(fill="x")
+
+        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
+                                 text_color=T("TEXT"), height=140, corner_radius=8,
+                                 border_color=T("BORDER"), border_width=1)
+        log_box.pack(fill="both", expand=True, pady=(10, 8))
+        log_box.configure(state="disabled")
+
+        bf = ctk.CTkFrame(content, fg_color="transparent")
+        bf.pack(fill="x")
+        btn = ctk.CTkButton(bf, text="Отмена", width=130, height=36,
+                            font=self._f(12), fg_color=T("SURFACE"),
+                            hover_color="#882828", text_color=T("SUB"),
+                            corner_radius=8, command=cancel.set)
+        btn.pack(side="right")
+
+        def _append(line):
+            log_box.configure(state="normal")
+            log_box.insert("end", str(line) + "\n")
+            log_box.see("end")
+            log_box.configure(state="disabled")
+
+        def _item(n, total_n, label):
+            cur_lbl.configure(text=f"[{n}/{total_n}] {label}" if total_n > 1 else label)
+            bar.set(0)
+
+        def _progress(done, total, gdone, gtotal, spd, left):
+            pct = (done / total) if total else 0
+            bar.set(max(0.0, min(1.0, pct)))
+            stat_lbl.configure(
+                text=f"{pct*100:3.0f}%  ·  {_fmt_mb(done)} / {_fmt_mb(total)}"
+                     f"  ·  {spd/1024/1024:.1f} МБ/с  ·  осталось {_fmt_eta(left)}")
+            if gbar is not None:
+                gp = (gdone / gtotal) if gtotal else 0
+                gbar.set(max(0.0, min(1.0, gp)))
+                gstat.configure(
+                    text=f"Всего: {_fmt_mb(gdone)} / {_fmt_mb(gtotal)} ({gp*100:.0f}%)")
+
+        def finish(ok, msg):
+            _append(msg)
+            if ok:
+                bar.set(1.0)
+                if gbar is not None:
+                    gbar.set(1.0)
+                cur_lbl.configure(text="Готово", text_color=T("GREEN"))
+                stat_lbl.configure(text=msg, text_color=T("GREEN"))
+            else:
+                cur_lbl.configure(text="Не завершено", text_color="#E8944A")
+                stat_lbl.configure(text=msg, text_color="#E8944A")
+            btn.configure(text="Закрыть", fg_color=T("SURFACE"),
+                          hover_color=T("BORDER"), command=close)
+
+        def _guard(fn):
+            """Вызвать в main-thread и промолчать, если панель уже закрыта."""
+            def call(*a):
+                if not alive[0]:
+                    return
+                try:
+                    fn(*a)
+                except Exception:
+                    alive[0] = False       # виджет исчез между проверкой и вызовом
+            return lambda *a: self.after(0, call, *a)
+
+        ui = {
+            "append":   _guard(_append),
+            "status":   _guard(lambda s: cur_lbl.configure(text=s)),
+            "item":     _guard(_item),
+            "progress": _guard(_progress),
+        }
+        return ui, _guard(finish)
+
+    # ──────────────────────────────────────────────────────────
+    #  Загрузка 1: модель Whisper (.pt)
+    # ──────────────────────────────────────────────────────────
     def _download_selected_model(self):
-        """Скачать выбранную модель в whisper_models/ — с докачкой и проверкой
-        SHA256. Канал к CDN из РФ медленный, поэтому: резюмируемая загрузка
-        (Range) + контрольная сумма, чтобы обрыв не оставлял битый файл."""
+        """Скачать выбранную модель в whisper_models/ — тем же загрузчиком,
+        что и движок: 8 потоков, докачка, проверка SHA256 из URL."""
         m = self.model_var.get() if hasattr(self, "model_var") else ""
         if m not in _WHISPER_URLS:
             return
         url, sha, dest = _model_url_parts(m)
-        sz = _MODEL_SIZE.get(m, "?")
         cancel = threading.Event()
+        ui, finish = self._dl_panel(
+            "Загрузка",
+            f"Модель Whisper «{m}» (~{_MODEL_SIZE.get(m, '?')}) — в папку программы.\n"
+            "Можно прервать и докачать позже: прогресс сохраняется.",
+            cancel, multi=False)
+        ui["append"](f"Источник: {url}")
+        ui["append"](f"Файл: {dest}")
 
-        overlay, content, close = self._overlay(
-            f"Скачивание модели «{m}»", width=560, height=360)
-        ctk.CTkLabel(content,
-                     text=f"Модель «{m}» (~{sz}) скачивается в папку программы.\n"
-                          "Можно прервать и докачать позже — прогресс сохраняется.",
-                     font=self._f(11), text_color=T("SUB"),
-                     justify="center").pack(pady=(2, 10))
-        pbar = ctk.CTkProgressBar(content, height=8, fg_color=T("SURFACE"),
-                                  progress_color=T("ACCENT"), corner_radius=2)
-        pbar.pack(fill="x", pady=(4, 2)); pbar.set(0)
-        plbl = ctk.CTkLabel(content, text="Подключение…", font=self._f(10),
-                            text_color=T("SUB"))
-        plbl.pack(anchor="w")
-        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
-                                 text_color=T("TEXT"), height=140, corner_radius=8,
-                                 border_color=T("BORDER"), border_width=1)
-        log_box.pack(fill="both", expand=True, pady=(8, 8))
-        log_box.configure(state="disabled")
-        bf = ctk.CTkFrame(content, fg_color="transparent"); bf.pack(fill="x")
-        action_btn = ctk.CTkButton(bf, text="Отмена", width=130, height=36,
-                                   font=self._f(12), fg_color=T("SURFACE"),
-                                   hover_color="#882828", text_color=T("SUB"),
-                                   corner_radius=8, command=cancel.set)
-        action_btn.pack(side="right")
-
-        def _append(line):
-            log_box.configure(state="normal")
-            log_box.insert("end", line + "\n"); log_box.see("end")
-            log_box.configure(state="disabled")
-
-        def progress(frac, done, total, speed):
-            pbar.set(max(0.0, min(1.0, frac)))
-            plbl.configure(text=f"{done/1024/1024:.0f} / {total/1024/1024:.0f} МБ  "
-                                f"·  {speed:.1f} МБ/с")
-
-        def done(success, message):
+        def worker():
+            err = dl_fetch_all([DLItem(url, dest, sha=sha, label=f"{m}.pt")],
+                               cancel, ui)
             self._model_dl_active = False
-            self._update_model_status()
-            _append(message)
-            if success:
-                pbar.set(1.0)
-                plbl.configure(text="Готово — модель проверена и готова к работе.",
-                               text_color=T("GREEN"))
+            self.after(0, self._update_model_status)
+            if err is None:
+                finish(True, "Модель проверена и готова к работе.")
+            elif err == "cancelled":
+                finish(False, "Отменено — прогресс сохранён, можно докачать.")
             else:
-                plbl.configure(text=message, text_color="#E8944A")
-            action_btn.configure(text="Закрыть", fg_color=T("SURFACE"),
-                                 hover_color=T("BORDER"), command=close)
+                finish(False, f"{err} — прогресс сохранён, докачайте.")
 
         self._model_dl_active = True
         self._update_model_status()
-        ui = {
-            "append":  lambda s: self.after(0, _append, s),
-            "progress": lambda *a: self.after(0, progress, *a),
-            "status":  lambda s: self.after(0, plbl.configure, {"text": s}),
-            "done":    lambda ok, msg: self.after(0, done, ok, msg),
-            "cancel":  cancel,
-        }
-        threading.Thread(target=self._download_model_worker,
-                         args=(m, ui), daemon=True).start()
-
-    # Качаем модель в N параллельных соединений (как менеджер загрузок/торрент):
-    # один HTTPS-поток к CDN из РФ шейпится, а 8 потоков складывают скорость.
-    _DL_CONNECTIONS = 8
-    _DL_CHUNK = 16 * 1024 * 1024   # размер куска под одно Range-соединение
-
-    def _download_model_worker(self, m, ui):
-        import hashlib, urllib.request, time, json
-        import threading as _th, queue as _q
-        try:
-            url, sha, dest = _model_url_parts(m)
-            WHISPER_MODELS.mkdir(parents=True, exist_ok=True)
-            part = dest.with_name(dest.name + ".part")
-            idxf = dest.with_name(dest.name + ".idx")   # индекс готовых кусков
-            ui["append"](f"Источник: {url}")
-            ui["append"](f"Файл: {dest}")
-
-            # Узнаём полный размер + поддержку Range (Content-Range при 206).
-            def _probe():
-                rq = urllib.request.Request(url)
-                rq.add_header("Range", "bytes=0-0")
-                r = urllib.request.urlopen(rq, timeout=30)
-                cr = r.headers.get("Content-Range", "")
-                code = r.getcode()
-                cl = r.headers.get("Content-Length")
-                r.close()
-                if code == 206 and "/" in cr:
-                    return int(cr.rsplit("/", 1)[-1]), True
-                return int(cl or 0), False
-            total, ranges = _probe()
-
-            if not ranges or total <= 0:
-                ui["append"]("Сервер не поддержал многопоточность — качаю в 1 поток")
-                return self._download_single_stream(url, sha, dest, part, total, ui)
-
-            n_conn = max(1, min(self._DL_CONNECTIONS, (total // self._DL_CHUNK) + 1))
-            n_chunks = (total + self._DL_CHUNK - 1) // self._DL_CHUNK
-            ui["append"](f"Размер: {total/1024/1024:.0f} МБ · потоков: {n_conn} · "
-                         f"кусков по {self._DL_CHUNK//1024//1024} МБ: {n_chunks}")
-
-            # Докачка: читаем индекс готовых кусков, если .part уже нужного размера.
-            done_idx = set()
-            if idxf.exists() and part.exists() and part.stat().st_size == total:
-                try:
-                    done_idx = set(json.loads(idxf.read_text()))
-                    ui["append"](f"Докачка: уже готово {len(done_idx)}/{n_chunks} кусков")
-                except Exception:
-                    done_idx = set()
-            else:
-                # Свежий старт — преаллоцируем файл на полный размер.
-                with open(part, "wb") as f:
-                    f.truncate(total)
-                done_idx = set()
-
-            lock = _th.Lock()
-            done_bytes = [min(len(done_idx) * self._DL_CHUNK, total)]
-            init_bytes = done_bytes[0]
-            t0 = time.time()
-            err = [None]
-            tasks = _q.Queue()
-            for i in range(n_chunks):
-                if i not in done_idx:
-                    tasks.put(i)
-
-            def worker():
-                while err[0] is None and not ui["cancel"].is_set():
-                    try:
-                        i = tasks.get_nowait()
-                    except _q.Empty:
-                        return
-                    start = i * self._DL_CHUNK
-                    end = min(start + self._DL_CHUNK, total) - 1
-                    want = end - start + 1
-                    last_e = None
-                    for _attempt in range(3):
-                        if ui["cancel"].is_set():
-                            return
-                        try:
-                            rq = urllib.request.Request(url)
-                            rq.add_header("Range", f"bytes={start}-{end}")
-                            r = urllib.request.urlopen(rq, timeout=30)
-                            data = r.read(); r.close()
-                            if len(data) != want:
-                                raise IOError(f"неполный кусок {len(data)}/{want}")
-                            with open(part, "r+b") as f:
-                                f.seek(start); f.write(data)
-                            last_e = None
-                            break
-                        except Exception as e:
-                            last_e = e
-                            time.sleep(1.0)
-                    if last_e is not None:
-                        err[0] = last_e
-                        return
-                    with lock:
-                        done_idx.add(i)
-                        done_bytes[0] = min(done_bytes[0] + want, total)
-                        try: idxf.write_text(json.dumps(sorted(done_idx)))
-                        except Exception: pass
-                        now = time.time()
-                        spd = (done_bytes[0] - init_bytes) / max(now - t0, 0.01) / 1024 / 1024
-                        ui["progress"](done_bytes[0] / total, done_bytes[0], total, spd)
-
-            threads = [_th.Thread(target=worker, daemon=True) for _ in range(n_conn)]
-            for t in threads: t.start()
-            for t in threads: t.join()
-
-            if ui["cancel"].is_set():
-                ui["done"](False, "Отменено — прогресс сохранён, можно докачать.")
-                return
-            if err[0] is not None:
-                ui["done"](False, f"Ошибка сети: {err[0]} — прогресс сохранён, докачайте.")
-                return
-
-            ui["status"]("Проверка контрольной суммы (SHA256)…")
-            ui["append"]("Скачано, проверяю целостность…")
-            h = hashlib.sha256()
-            with open(part, "rb") as f:
-                for b in iter(lambda: f.read(1048576), b""):
-                    h.update(b)
-            if h.hexdigest() != sha:
-                for p in (part, idxf):
-                    try: p.unlink()
-                    except Exception: pass
-                ui["done"](False, "SHA256 не совпал — файл повреждён. Нажмите «Скачать» ещё раз.")
-                return
-            if dest.exists():
-                dest.unlink()
-            part.rename(dest)
-            try: idxf.unlink()
-            except Exception: pass
-            ui["done"](True, "✓ Контрольная сумма верна.")
-        except Exception as e:
-            ui["done"](False, f"Ошибка загрузки: {e}")
-
-    def _download_single_stream(self, url, sha, dest, part, total, ui):
-        """Запасной путь: один поток с докачкой (если сервер не отдаёт Range)."""
-        import hashlib, urllib.request, time
-        try:
-            resume = part.stat().st_size if part.exists() else 0
-            req = urllib.request.Request(url)
-            if resume:
-                req.add_header("Range", f"bytes={resume}-")
-            resp = urllib.request.urlopen(req, timeout=30)
-            if resume and resp.getcode() != 206:
-                resume = 0
-                try: part.unlink()
-                except Exception: pass
-            if not total:
-                total = int(resp.headers.get("Content-Length") or 0) + resume
-            downloaded = resume
-            t0 = time.time(); last = 0.0
-            with open(part, "ab" if resume else "wb") as f:
-                while True:
-                    if ui["cancel"].is_set():
-                        ui["done"](False, "Отменено — прогресс сохранён, можно докачать.")
-                        return
-                    chunk = resp.read(262144)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.time()
-                    if now - last > 0.3:
-                        last = now
-                        spd = (downloaded - resume) / max(now - t0, 0.01) / 1024 / 1024
-                        ui["progress"](downloaded / total if total else 0,
-                                       downloaded, total, spd)
-            ui["status"]("Проверка контрольной суммы (SHA256)…")
-            h = hashlib.sha256()
-            with open(part, "rb") as f:
-                for b in iter(lambda: f.read(1048576), b""):
-                    h.update(b)
-            if h.hexdigest() != sha:
-                try: part.unlink()
-                except Exception: pass
-                ui["done"](False, "SHA256 не совпал — файл повреждён. Нажмите «Скачать» ещё раз.")
-                return
-            if dest.exists():
-                dest.unlink()
-            part.rename(dest)
-            ui["done"](True, "✓ Контрольная сумма верна.")
-        except Exception as e:
-            ui["done"](False, f"Ошибка загрузки: {e}")
+        threading.Thread(target=worker, daemon=True).start()
 
     # ──────────────────────────────────────────────────────────
     #  Выгрузка переписки из ВКонтакте (VK API) прямо из GUI
@@ -2035,146 +2280,194 @@ class App(_BaseApp):
             self._cfg["vk_tokens"] = toks
         self._save_cfg()
 
+    # ──────────────────────────────────────────────────────────
+    #  Загрузка 2: движок Whisper (torch + openai-whisper)
+    # ──────────────────────────────────────────────────────────
+    #  Раньше тут просто дёргался `pip install` и крутился бегунок без
+    #  процентов: pip, когда его stdout — не терминал, прогресс-бар не
+    #  рисует вообще, только строки «Downloading torch-...whl (2.5 GB)».
+    #  Поэтому порядок теперь такой:
+    #    1) pip --dry-run --report — узнаём точный список колёс и их URL,
+    #       ничего не ставя;
+    #    2) качаем колёса своим загрузчиком — те же 8 потоков, докачка,
+    #       честный процент по байтам, что и у моделей;
+    #    3) pip install --no-index из скачанной папки — уже без сети.
+    #  Побочный выигрыш: 2.5 ГБ torch тянутся в 8 потоков, а не в один,
+    #  и оборванная установка продолжается с места обрыва.
+
+    WHEELS_DIR_NAME = "_wheels"
+    TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu124"
+
+    def _pip_resolve(self, args, log):
+        """Список (имя, версия, url) через `pip install --dry-run --report`.
+        Возвращает None, только если pip вообще не смог составить план.
+
+        Исходники (.tar.gz) в списке допустимы: сам openai-whisper приезжает
+        именно так. Они весят килобайты, собираются локально, а гигабайты —
+        это torch, и он колесом. Так что качаем всё подряд, а pip потом
+        ставит из папки офлайн."""
+        import tempfile, json
+        kw = {"creationflags": 0x08000000} if IS_WIN else {}
+        rep = Path(tempfile.gettempdir()) / f"mergechat_pipreport_{os.getpid()}.json"
+        cmd = [sys.executable, "-m", "pip", "install", "--dry-run",
+               "--ignore-installed", "--quiet", "--report", str(rep)] + args
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, encoding="utf-8", errors="replace", **kw)
+            if p.returncode != 0:
+                log(f"pip не смог составить план: {(p.stdout or '').strip()[:400]}")
+                return None
+            data = json.loads(rep.read_text(encoding="utf-8"))
+        except Exception as e:
+            log(f"Не удалось разобрать план pip: {e}")
+            return None
+        finally:
+            try:
+                rep.unlink()
+            except Exception:
+                pass
+        out = []
+        for pkg in data.get("install", []):
+            url = (pkg.get("download_info") or {}).get("url", "")
+            meta = pkg.get("metadata") or {}
+            if not url:
+                log(f"{meta.get('name', '?')}: pip не дал ссылку — обычный pip")
+                return None
+            out.append((meta.get("name", "?"), meta.get("version", "?"), url))
+        return out
+
     def _show_install_dialog(self):
         has_nv = _has_nvidia()
-        size_str = "~2.5 ГБ (NVIDIA CUDA)" if has_nv else "~300 МБ (CPU)"
+        cancel = threading.Event()
+        ui, finish = self._dl_panel(
+            "Установка Whisper",
+            ("Whisper + PyTorch с поддержкой NVIDIA CUDA (~2.6 ГБ)."
+             if has_nv else "Whisper + PyTorch, версия для CPU (~300 МБ)."),
+            cancel, multi=True)
 
-        overlay, content, close = self._overlay(
-            "Установка Whisper", width=560, height=480)
+        wheels_dir = LOCAL_PKGS / self.WHEELS_DIR_NAME
 
-        ctk.CTkLabel(content,
-                     text=f"Будет установлено: Whisper + PyTorch  ({size_str})\n"
-                          "Нужен интернет. После установки перезапуск не нужен.",
-                     font=self._f(11), text_color=T("SUB"),
-                     justify="center").pack(pady=(2, 10))
+        def worker():
+            kw = {"creationflags": 0x08000000} if IS_WIN else {}
+            log = ui["append"]
+            log(f"Папка установки: {LOCAL_PKGS}")
 
-        pbar = ctk.CTkProgressBar(content, height=6, fg_color=T("SURFACE"),
-                                   progress_color=T("ACCENT"), corner_radius=2)
-        pbar.pack(fill="x", pady=(4, 2))
-        pbar.set(0)
-        plbl = ctk.CTkLabel(content, text="", font=self._f(10), text_color=T("SUB"))
-        plbl.pack(anchor="w")
-
-        log_box = ctk.CTkTextbox(content, font=self._mono(11), fg_color=T("SURFACE"),
-                                  text_color=T("TEXT"), height=200, corner_radius=8,
-                                  border_color=T("BORDER"), border_width=1)
-        log_box.pack(fill="both", expand=True, pady=(8, 8))
-        log_box.configure(state="disabled")
-
-        bf = ctk.CTkFrame(content, fg_color="transparent")
-        bf.pack(fill="x")
-
-        close_btn = ctk.CTkButton(bf, text="Закрыть", width=110, height=36,
-                                   font=self._f(12), fg_color=T("SURFACE"),
-                                   hover_color=T("BORDER"), text_color=T("SUB"),
-                                   corner_radius=8, state="disabled", command=close)
-        close_btn.pack(side="left")
-
-        install_btn = ctk.CTkButton(bf, text="Установить", width=140, height=36,
-                                     font=self._f(12, "bold"), fg_color=T("ACCENT"),
-                                     hover_color=T("ACCENT2"), corner_radius=8)
-        install_btn.pack(side="right")
-
-        def _append(line):
-            log_box.configure(state="normal")
-            log_box.insert("end", line + "\n")
-            log_box.see("end")
-            log_box.configure(state="disabled")
-
-        def on_done(success):
-            pbar.stop()
-            pbar.configure(mode="determinate")
-            close_btn.configure(state="normal")
-            if success:
-                pbar.set(1.0)
-                plbl.configure(text="Готово! Голосовые будут расшифровываться при следующем запуске.")
-                install_btn.configure(text="✓ Установлено", fg_color=T("GREEN"), state="disabled")
-                self._whisper_installed = True
-                self._whisper_banner.pack_forget()
-                self._update_model_status()
-            else:
-                pbar.set(0)
-                plbl.configure(text="Ошибка. Проверьте лог выше.")
-                install_btn.configure(text="Повторить", state="normal", fg_color="#AA3333",
-                                       command=do_install)
-
-        def do_install():
-            install_btn.configure(state="disabled", text="Установка...")
-            pbar.configure(mode="indeterminate")
-            pbar.start()
-
-            def run():
-                kw = {"creationflags": 0x08000000} if IS_WIN else {}
-
-                target = str(LOCAL_PKGS)
-                base_args = ["--target", target, "--upgrade"]
-
-                def run_pip(args, label):
-                    self.after(0, plbl.configure, {"text": label})
-                    # encoding/errors ОБЯЗАТЕЛЬНЫ: без них text=True берёт кодировку
-                    # локали (на русской Windows cp1251), а pip пишет UTF-8. Байт
-                    # 0x98 в cp1251 не определён -> UnicodeDecodeError прямо в цикле
-                    # чтения, поток установки умирает молча и окно висит навсегда.
-                    proc = subprocess.Popen(
-                        [sys.executable, "-m", "pip", "install"] + base_args + args,
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, encoding="utf-8", errors="replace", **kw)
-                    for line in proc.stdout:
-                        line = line.rstrip()
-                        if line:
-                            self.after(0, _append, line)
-                            if len(line) < 80:
-                                self.after(0, plbl.configure, {"text": line})
-                    proc.wait()
-                    return proc.returncode
-
-                self.after(0, _append, f"Папка установки: {target}")
-
-                env = os.environ.copy()
-                env["PYTHONPATH"] = target + os.pathsep + env.get("PYTHONPATH", "")
-                cuda_ok = False
-                if has_nv and (LOCAL_PKGS / "torch").is_dir():
-                    try:
-                        check = subprocess.run(
-                            [sys.executable, "-c",
-                             "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"],
-                            capture_output=True, env=env, **kw)
-                        cuda_ok = (check.returncode == 0)
-                    except Exception:
-                        cuda_ok = False
-
-                # ВАЖНО: для NVIDIA-машин ставим whisper ПЕРВЫМ, потом CUDA-torch с
-                # --force-reinstall. Иначе whisper тянет torch из PyPI (CPU-only)
-                # и перезаписывает уже установленный CUDA-torch → расшифровка идёт на CPU.
-                if has_nv:
-                    r2 = run_pip(["openai-whisper"], "Скачивание Whisper...")
-                    if cuda_ok and r2 == 0:
-                        # Проверим, что whisper не сбил CUDA-torch
-                        try:
-                            check2 = subprocess.run(
-                                [sys.executable, "-c",
-                                 "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"],
-                                capture_output=True, env=env, **kw)
-                            cuda_ok = (check2.returncode == 0)
-                        except Exception:
-                            cuda_ok = False
-                    if cuda_ok:
-                        self.after(0, _append, "torch CUDA уже установлен — пропускаем")
-                        r1 = 0
-                    else:
-                        r1 = run_pip(["torch", "--index-url",
-                                      "https://download.pytorch.org/whl/cu124",
-                                      "--force-reinstall"],
-                                     "Скачивание PyTorch CUDA (~2.5 ГБ)...")
+            # ── 1. План: что именно качать ──
+            ui["status"]("Составляю список пакетов…")
+            plan = self._pip_resolve(["openai-whisper"], log)
+            if plan is not None and has_nv:
+                # torch с CUDA живёт только на своём индексе; берём его оттуда
+                # и перекрываем им CPU-torch из плана whisper — иначе колесо
+                # с PyPI молча положит расшифровку на процессор.
+                tplan = self._pip_resolve(
+                    ["torch", "--index-url", self.TORCH_CUDA_INDEX], log)
+                if tplan is None:
+                    plan = None
                 else:
-                    r1 = run_pip(["torch"], "Скачивание PyTorch CPU (~300 МБ)...")
-                    r2 = run_pip(["openai-whisper"], "Скачивание Whisper...")
+                    by_name = {n.lower(): (n, v, u) for n, v, u in plan}
+                    by_name.update({n.lower(): (n, v, u) for n, v, u in tplan})
+                    plan = list(by_name.values())
 
-                self.after(0, on_done, r1 == 0 and r2 == 0)
+            if plan is None:
+                log("Перехожу на обычный pip — процентов не будет, "
+                    "но установка пройдёт.")
+                ok = self._pip_install_fallback(has_nv, log, kw)
+                self.after(0, self._on_whisper_installed, ok)
+                finish(ok, "Установлено." if ok else
+                       "Не удалось установить — смотрите лог.")
+                return
 
-            threading.Thread(target=run, daemon=True).start()
+            log("В плане " + _plural(len(plan), ("пакет", "пакета", "пакетов")))
 
-        install_btn.configure(command=do_install)
+            # ── 2. Качаем колёса своим загрузчиком ──
+            items = []
+            for name, ver, url in plan:
+                fname = url.rsplit("/", 1)[-1].split("?")[0]
+                from urllib.parse import unquote
+                items.append(DLItem(url, wheels_dir / unquote(fname),
+                                    label=f"{name} {ver}"))
+            err = dl_fetch_all(items, cancel, ui)
+            if err == "cancelled":
+                finish(False, "Отменено — скачанное сохранено, "
+                              "установка продолжится с этого места.")
+                return
+            if err:
+                finish(False, f"{err} — скачанное сохранено, повторите.")
+                return
+
+            # ── 3. Ставим из локальной папки, сеть больше не нужна ──
+            ui["status"]("Устанавливаю пакеты…")
+            ui["progress"](0, 1, 1, 1, 0, None)
+            files = [str(it.dest) for it in items]
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "--target",
+                 str(LOCAL_PKGS), "--upgrade", "--no-deps", "--no-index",
+                 "--find-links", str(wheels_dir)] + files,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", **kw)
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log(line)
+            proc.wait()
+            ok = (proc.returncode == 0
+                  and (LOCAL_PKGS / "whisper").is_dir()
+                  and (LOCAL_PKGS / "torch").is_dir())
+            if not ok:
+                # Офлайн-сборка исходника может не сойтись (нет компилятора,
+                # не хватило build-зависимости). Гигабайты уже скачаны — добираем
+                # остаток обычным pip, а не роняем всю установку.
+                log("Офлайн-установка не завершилась — добираю обычным pip…")
+                ok = self._pip_install_fallback(has_nv, log, kw)
+            if ok:
+                # Колёса больше не нужны — это ещё столько же гигабайт на диске.
+                import shutil
+                shutil.rmtree(wheels_dir, ignore_errors=True)
+            self.after(0, self._on_whisper_installed, ok)
+            finish(ok,
+                   "Готово. Голосовые будут расшифровываться сразу, "
+                   "перезапуск не нужен." if ok else
+                   "pip вернул ошибку — смотрите лог. Скачанные колёса "
+                   "сохранены, повтор не будет качать заново.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pip_install_fallback(self, has_nv, log, kw):
+        """Запасной путь, если план через --report не сложился: обычный pip.
+        Порядок для NVIDIA важен — whisper тянет CPU-torch с PyPI и затирает
+        CUDA-сборку, поэтому CUDA-torch ставим последним."""
+        def run_pip(args, label):
+            log(label)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "--target",
+                 str(LOCAL_PKGS), "--upgrade"] + args,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", **kw)
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log(line)
+            proc.wait()
+            return proc.returncode
+
+        r2 = run_pip(["openai-whisper"], "Устанавливаю Whisper…")
+        if has_nv:
+            r1 = run_pip(["torch", "--index-url", self.TORCH_CUDA_INDEX,
+                          "--force-reinstall"], "Устанавливаю PyTorch CUDA…")
+        else:
+            r1 = 0
+        return r1 == 0 and r2 == 0
+
+    def _on_whisper_installed(self, ok):
+        """Обновить состояние UI после установки — строго в main-thread."""
+        if not ok:
+            return
+        self._whisper_installed = True
+        try:
+            self._whisper_banner.pack_forget()
+        except Exception:
+            pass
+        self._update_model_status()
 
     def _show_whisper_uninstall_dialog(self):
         overlay, content, close = self._overlay(
