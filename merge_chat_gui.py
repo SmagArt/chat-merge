@@ -2,6 +2,27 @@
 import sys, os, threading, subprocess, re, platform, multiprocessing, json
 from pathlib import Path
 
+# ── Пакеты проги живут ВНУТРИ папки установки, а не в системном Python.
+# Две папки, потому что у них разная судьба:
+#   base_packages  — customtkinter, bs4, tkinterdnd2 и т.п. Без них не
+#                    стартует само окно, поэтому их не трогает никто, кроме
+#                    деинсталлятора.
+#   local_packages — whisper + torch, несколько гигабайт. Их сносит кнопка
+#                    «Удалить Whisper», и окно после этого обязано открыться.
+# Раньше базовые ставились в системный Python (setup_base.bat без --target),
+# и удаление проги оставляло их там навсегда. Путь добавляем ДО первого
+# импорта стороннего пакета — иначе подхватится системная копия.
+_APP_DIR = Path(__file__).resolve().parent
+BASE_PKGS = _APP_DIR / "base_packages"
+LOCAL_PKGS = _APP_DIR / "local_packages"
+for _p in (BASE_PKGS, LOCAL_PKGS):
+    try:
+        _p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
 try:
     import customtkinter as ctk
 except ImportError:
@@ -26,16 +47,8 @@ except ImportError:
     _HAS_DND = False
     DND_FILES = None
 
-# ── Локальная папка для Whisper/torch — не системная.
-# Так удаление MergeChat реально удаляет всё, что прога ставила через UI,
-# и `Whisper не установлен` снова показывается после переустановки.
-def _local_packages_dir() -> Path:
-    return Path(__file__).resolve().parent / "local_packages"
-
-LOCAL_PKGS = _local_packages_dir()
-LOCAL_PKGS.mkdir(parents=True, exist_ok=True)
-if str(LOCAL_PKGS) not in sys.path:
-    sys.path.insert(0, str(LOCAL_PKGS))
+# BASE_PKGS / LOCAL_PKGS заданы в самом верху файла — до первого импорта
+# стороннего пакета, иначе customtkinter подтянулся бы из системного Python.
 
 # Модели Whisper (tiny…large .pt) храним внутри папки проги — whisper_models/,
 # а не в общем ~/.cache/whisper. Так удаление MergeChat уносит модели с собой.
@@ -458,7 +471,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.8"
+VERSION = "2.9"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5

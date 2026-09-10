@@ -1,5 +1,5 @@
-#define AppName "Merge Chat"
-#define AppVersion "2.8"
+﻿#define AppName "Merge Chat"
+#define AppVersion "2.9"
 #define AppPublisher "Artem Smagin"
 #define AppURL "https://github.com/SmagArt/chat-merge"
 
@@ -37,6 +37,13 @@ Type: filesandordirs; Name: "{app}\python\Lib\site-packages\torch"
 Type: filesandordirs; Name: "{app}\python\Lib\site-packages\torch-*"
 Type: filesandordirs; Name: "{app}\python\Lib\site-packages\whisper"
 Type: filesandordirs; Name: "{app}\python\Lib\site-packages\openai_whisper*"
+; base_packages пересобираем начисто: они весят десятки мегабайт, а хвост от
+; прошлой версии тут дороже, чем повторная установка. local_packages (whisper
+; + torch, гигабайты) НЕ трогаем — переустановка не должна стоить 2.6 ГБ.
+Type: filesandordirs; Name: "{app}\base_packages"
+; Недокачанные колёса движка — мусор от прерванной установки, до 2.6 ГБ.
+Type: filesandordirs; Name: "{app}\local_packages\_wheels"
+Type: files; Name: "{app}\pkgs_ok.flag"
 Type: files; Name: "{app}\__pycache__\*"
 
 [Files]
@@ -79,3 +86,56 @@ Filename: "{sys}\wscript.exe"; Parameters: """{app}\launcher_win.vbs"""; Working
 ; может использовать другая прога — voice-diarizer); он чистится осознанно
 ; через кнопку «Удалить Whisper» в GUI.
 Type: filesandordirs; Name: "{app}"
+
+[Code]
+// Пакеты проги с версии 2.9 лежат внутри {app} и уходят вместе с ней.
+// Но версии до 2.9 ставили базовые пакеты (а когда-то и whisper с torch) в
+// site-packages системного Python, и удаление папки их там не трогало.
+// Предлагаем дочистить — но только по явному согласию и списком: эти же
+// пакеты мог поставить себе кто-то другой.
+const
+  LEGACY_PKGS = 'customtkinter tkinterdnd2 imageio-ffmpeg beautifulsoup4 openai-whisper torch';
+
+function GetRecordedPython(): String;
+var
+  S: AnsiString;
+  P: Integer;
+begin
+  Result := '';
+  // Путь к интерпретатору записал setup_base.bat при установке — это точнее,
+  // чем гадать по стандартным местам, особенно под elevated-деинсталлятором.
+  if LoadStringFromFile(ExpandConstant('{app}\python_path.txt'), S) then
+  begin
+    Result := Trim(String(S));
+    P := Pos(#13, Result);
+    if P > 0 then Result := Copy(Result, 1, P - 1);
+    P := Pos(#10, Result);
+    if P > 0 then Result := Copy(Result, 1, P - 1);
+    Result := Trim(Result);
+  end;
+  if (Result <> '') and (not FileExists(Result)) then Result := '';
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Py: String;
+  Code: Integer;
+begin
+  if CurUninstallStep <> usUninstall then Exit;
+  Py := GetRecordedPython();
+  if Py = '' then Exit;
+  if MsgBox('Удалить также пакеты, которые прошлые версии Merge Chat'#13#10 +
+            'поставили в системный Python?'#13#10#13#10 +
+            Py + #13#10#13#10 +
+            'Будут удалены: customtkinter, tkinterdnd2, imageio-ffmpeg,'#13#10 +
+            'beautifulsoup4, openai-whisper, torch.'#13#10#13#10 +
+            'Нажмите «Нет», если этими пакетами пользуется что-то ещё —'#13#10 +
+            'сама Merge Chat их больше не использует, всё её хозяйство'#13#10 +
+            'лежит внутри папки установки и удаляется в любом случае.',
+            mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+  begin
+    Exec(Py, '-m pip uninstall -y ' + LEGACY_PKGS, '', SW_HIDE,
+         ewWaitUntilTerminated, Code);
+    // Код возврата не проверяем: «пакета и не было» — не ошибка.
+  end;
+end;

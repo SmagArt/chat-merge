@@ -22,3 +22,11 @@ tools/.env
 tools/vk_export/
 # Личная шпаргалка с peer_id/именами — только локально
 ВЫГРУЗКА_ВК_прочитай_утром.md
+
+# Рабочие папки и файлы установленной копии — создаются прогой
+# внутри {app}, в репозиторий попадать не должны.
+whisper_models/
+local_packages/
+base_packages/
+pkgs_ok.flag
+python_path.txt

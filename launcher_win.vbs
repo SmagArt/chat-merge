@@ -57,19 +57,22 @@ Dim pyS : pyS = S(py)
 Log "python=" & pyS
 
 ' --- Install packages if missing (check once, then skip via flag) ---
+' Packages now live in {app}\base_packages, so a bare "python -c import
+' customtkinter" would either miss them or, worse, find a leftover system-wide
+' copy and report success while base_packages is actually empty. Check the
+' folder on disk instead - no quoting games, no false positives.
+Dim baseCtk : baseCtk = scriptDir & "\base_packages\customtkinter"
 Dim pkgsFlag : pkgsFlag = scriptDir & "\pkgs_ok.flag"
-If Not fso.FileExists(pkgsFlag) Then
-    Dim chk : chk = RunQ(pyS & " -c ""import customtkinter""")
-    Log "packages=" & chk
-    If chk <> 0 Then
+If Not fso.FileExists(pkgsFlag) Or Not fso.FolderExists(baseCtk) Then
+    Log "base_packages check: " & fso.FolderExists(baseCtk)
+    If Not fso.FolderExists(baseCtk) Then
         Dim bat : bat = scriptDir & "\setup_base.bat"
         If Not fso.FileExists(bat) Then
             MsgBox "setup_base.bat not found!", 16, "Merge Chat"
             WScript.Quit 1
         End If
         RunQ "powershell -NoProfile -WindowStyle Hidden -Command ""Start-Process cmd -ArgumentList '/c """ & S(bat) & """' -Wait -WindowStyle Hidden"""
-        chk = RunQ(pyS & " -c ""import customtkinter""")
-        If chk <> 0 Then
+        If Not fso.FolderExists(baseCtk) Then
             MsgBox "Installation failed. See install_log.txt", 16, "Merge Chat"
             WScript.Quit 1
         End If

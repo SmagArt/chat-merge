@@ -37,6 +37,14 @@ import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime
+
+# Базовые пакеты проги лежат в {app}\base_packages, а не в системном Python.
+# Путь нужен ДО импорта bs4, иначе при чистом системном Python модуль не
+# найдётся. (whisper/torch подключаются ниже, отдельно — они в local_packages.)
+_base_pkgs = Path(__file__).resolve().parent / "base_packages"
+if _base_pkgs.is_dir() and str(_base_pkgs) not in sys.path:
+    sys.path.insert(0, str(_base_pkgs))
+
 from bs4 import BeautifulSoup
 
 # UTF-8 stdout фиксируется только в main() — не на уровне модуля
