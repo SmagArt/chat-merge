@@ -1,7 +1,9 @@
 ﻿#define AppName "Merge Chat"
-#define AppVersion "2.9.2"
+#define AppVersion "2.9.3"
 #define AppPublisher "Artem Smagin"
 #define AppURL "https://github.com/SmagArt/chat-merge"
+; Должен совпадать с APP_USER_MODEL_ID в merge_chat_gui.py
+#define AppUserModelID "com.smagart.mergechat"
 
 [Setup]
 AppId={{B7F2C4A1-3D8E-4F92-A6B1-9C5D2E7F3A80}
@@ -63,8 +65,11 @@ Source: "launcher_win.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "tools\vk_fetch_history.py"; DestDir: "{app}\tools"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\launcher_win.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\merge_chat.ico"
-Name: "{autodesktop}\{#AppName}"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\launcher_win.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\merge_chat.ico"; Tasks: desktopicon
+; AppUserModelID — тот же, что ставит окно (APP_USER_MODEL_ID в merge_chat_gui.py).
+; Без него Windows не связывала запущенное окно (pythonw.exe) с ярлыком, и
+; «Закрепить на панели задач» закрепляло голый pythonw.exe со значком Python.
+Name: "{group}\{#AppName}"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\launcher_win.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\merge_chat.ico"; AppUserModelID: "{#AppUserModelID}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\launcher_win.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\merge_chat.ico"; AppUserModelID: "{#AppUserModelID}"; Tasks: desktopicon
 
 [Run]
 ; Step 1: Install Python 3.13 to {app}\python

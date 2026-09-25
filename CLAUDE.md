@@ -1,4 +1,4 @@
-# CLAUDE.md — Merge Chat v2.9.2
+# CLAUDE.md — Merge Chat v2.9.3
 
 ## Контекст
 Python GUI: объединяет переписки **Telegram** (JSON/HTML), **VK** (HTML-архив + API-JSON через `tools/vk_fetch_history.py`), **Instagram** (JSON), **WhatsApp** (TXT) в TXT/MD. Расшифровывает голосовые через OpenAI Whisper офлайн. GPU-ускорение: NVIDIA CUDA, Apple Silicon MPS.
@@ -21,7 +21,8 @@ GitHub: github.com/SmagArt/chat-merge
 | v2.7   | собран 11.06.2026: кнопка «⬇ Выгрузить из ВК» в GUI + `vk_fetch.bat` + фикс высоты окна/лога; имя установщика без `_admin` |
 | v2.8   | собран 18.06.2026: управление моделями кнопками (скачать/удалить, отражается на диске), многопоточная загрузка моделей (8 соединений, ~×3), проверка SHA256, статус модели по целостности (не по факту файла), кнопка «Обновить Whisper» |
 | v2.9 / 2.9.1 | 10–11.09.2026: пакеты проги в `{app}\base_packages` / `local_packages`, единый загрузчик, 403 на torch (UA). **2.9.1 после установки не запускается** — см. «Фиксы 2026-09-25» |
-| **v2.9.2** | 25.09.2026: полный аудит — ACL `base_packages`, лог и окно ошибки старта, кэш расшифровок, IG/WA/TG HTML, дубли VK/TG, стек оверлеев, удаление бандленого Python. **Текущая** |
+| v2.9.2 | 25.09.2026: полный аудит — ACL `base_packages`, лог и окно ошибки старта, кэш расшифровок, IG/WA/TG HTML, дубли VK/TG, стек оверлеев, удаление бандленого Python |
+| **v2.9.3** | 26.09.2026: закрепление на панели задач — AppUserModelID + Relaunch-свойства окна, AUMID в ярлыках установщика. **Текущая** |
 | v3.0   | backlog: миграция UI на PySide6 (см. `memory/project_chat_merge_qt_migration.md`) |
 
 **Установщик один** (`installer_windows.iss`, bundled Python, права администратора). Прежнее
@@ -140,6 +141,17 @@ medium на GPU (TTS-голосовые + кружочек).
 - Мелочи: drag&drop нескольких файлов, `mkstemp` вместо `mktemp`, `find_file` с `glob.escape`,
   лаунчер проверяет Program Files, скорость в МБ/с, NVIDIA-детект в фоне, гонка счётчиков
   загрузчика, `message_*.json` без цифр.
+
+### v2.9.3 — закрепление на панели задач
+
+Прога — это `pythonw.exe` со скриптом. «Закрепить» на запущенном окне закрепляло голый
+`pythonw.exe` без аргументов (значок Python, ничего не запускает): процесс ставит
+`SetCurrentProcessExplicitAppUserModelID`, а ни один ярлык этот ID не нёс — Windows не могла
+связать окно с ярлыком. Теперь окно само выставляет `System.AppUserModel.ID` +
+`RelaunchCommand` (wscript + `launcher_win.vbs`) / `RelaunchIconResource` /
+`RelaunchDisplayNameResource` через `SHGetPropertyStoreForWindow` (`_set_taskbar_identity`),
+а ярлыки установщика несут тот же `AppUserModelID`. ID задаётся в двух местах —
+`APP_USER_MODEL_ID` в GUI и `#define AppUserModelID` в `.iss`, менять вместе.
 
 ---
 

@@ -89,6 +89,8 @@ except Exception as _e:
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
 
+# Совпадает с #define AppUserModelID в installer_windows.iss — по нему Windows
+# связывает окно с ярлыком и закрепляет на панели задач именно Merge Chat.
 APP_USER_MODEL_ID = "com.smagart.mergechat"
 
 if IS_WIN:
@@ -596,7 +598,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.9.2"
+VERSION = "2.9.3"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -923,10 +925,7 @@ class App(_BaseApp):
             ICON_SMALL       = 0
             ICON_BIG         = 1
             path = str(ico_path)
-            # FindWindowW надёжнее GetParent для CustomTkinter
-            hwnd = ctypes.windll.user32.FindWindowW(None, self.title())
-            if not hwnd:
-                hwnd = self.winfo_id()
+            hwnd = self._toplevel_hwnd()
             hicon_big   = ctypes.windll.user32.LoadImageW(
                 None, path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
             hicon_small = ctypes.windll.user32.LoadImageW(
@@ -940,6 +939,102 @@ class App(_BaseApp):
                 pass
         except Exception:
             pass
+        self._set_taskbar_identity(ico_path)
+
+    def _toplevel_hwnd(self):
+        """HWND настоящего окна верхнего уровня (у Tk winfo_id — дочернее).
+        Раньше искали FindWindowW по заголовку «Merge Chat» — так находилось и
+        чужое окно с тем же именем, например открытая папка Merge Chat."""
+        import ctypes
+        hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)   # GA_ROOT
+        return hwnd or ctypes.windll.user32.FindWindowW(None, self.title()) or self.winfo_id()
+
+    def _relaunch_command(self) -> str:
+        """Чем панель задач перезапускает закреплённый значок: тем же лаунчером,
+        что и ярлык из «Пуска» (он же ищет Python и ставит пакеты)."""
+        here = Path(__file__).resolve().parent
+        if FROZEN:
+            return f'"{Path(sys.executable).resolve()}"'
+        vbs = here / "launcher_win.vbs"
+        wscript = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wscript.exe"
+        if vbs.exists() and wscript.exists():
+            return f'"{wscript}" "{vbs}"'
+        exe = Path(sys.executable)
+        pyw = exe.with_name("pythonw.exe")
+        return f'"{pyw if pyw.exists() else exe}" "{Path(__file__).resolve()}"'
+
+    def _set_taskbar_identity(self, ico_path):
+        """Кем окно представляется панели задач Windows.
+
+        Прога — это pythonw.exe со скриптом. Закрепляешь запущенное окно — и
+        Windows, не найдя ярлыка с нашим AppUserModelID, закрепляла сам
+        pythonw.exe без аргументов: значок Python, который ничего не запускает.
+        Даём окну штатные свойства System.AppUserModel.* (ID + команда,
+        иконка и имя для перезапуска) — тогда закрепляется именно Merge Chat,
+        даже если ярлыка в «Пуске» нет. Установщик вдобавок пишет тот же ID в
+        свои ярлыки."""
+        if not IS_WIN:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes, byref, POINTER, c_void_p, c_long, c_ulong
+
+            class GUID(ctypes.Structure):
+                _fields_ = [("d1", c_ulong), ("d2", ctypes.c_ushort),
+                            ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+
+            class PROPERTYKEY(ctypes.Structure):
+                _fields_ = [("fmtid", GUID), ("pid", c_ulong)]
+
+            class PROPVARIANT(ctypes.Structure):     # 16 байт на x86, 24 на x64
+                _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                            ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                            ("val", c_void_p), ("pad", c_void_p)]
+
+            def guid(s):
+                g = GUID()
+                ctypes.oledll.ole32.CLSIDFromString(s, byref(g))
+                return g
+
+            fmtid = guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}")   # System.AppUserModel
+            props = [
+                (5, APP_USER_MODEL_ID),                  # .ID
+                (2, self._relaunch_command()),           # .RelaunchCommand
+                # resolve(): лаунчер запускает по коротким именам 8.3 (MERGEC~1)
+                (3, f"{Path(ico_path).resolve()},0"),    # .RelaunchIconResource
+                (4, "Merge Chat"),                       # .RelaunchDisplayNameResource
+            ]
+            try:
+                ctypes.windll.ole32.CoInitialize(None)   # уже инициализирован — не беда
+            except Exception:
+                pass
+            pps = c_void_p()
+            iid = guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")    # IID_IPropertyStore
+            hr = ctypes.windll.shell32.SHGetPropertyStoreForWindow(
+                wintypes.HWND(self._toplevel_hwnd()), byref(iid), byref(pps))
+            if hr != 0 or not pps.value:
+                _gui_log(f"панель задач: SHGetPropertyStoreForWindow hr={hr & 0xFFFFFFFF:#x}")
+                return
+            vtbl = ctypes.cast(ctypes.cast(pps, POINTER(c_void_p))[0], POINTER(c_void_p))
+            SetValue = ctypes.WINFUNCTYPE(c_long, c_void_p, POINTER(PROPERTYKEY),
+                                          POINTER(PROPVARIANT))(vtbl[6])
+            Commit = ctypes.WINFUNCTYPE(c_long, c_void_p)(vtbl[7])
+            Release = ctypes.WINFUNCTYPE(c_ulong, c_void_p)(vtbl[2])
+            keep = []                                    # буферы живы до Commit
+            try:
+                for pid, text in props:
+                    buf = ctypes.create_unicode_buffer(text)
+                    keep.append(buf)
+                    pv = PROPVARIANT(vt=31, val=ctypes.cast(buf, c_void_p))   # VT_LPWSTR
+                    key = PROPERTYKEY(fmtid, pid)
+                    hr = SetValue(pps, byref(key), byref(pv))
+                    if hr != 0:
+                        _gui_log(f"панель задач: SetValue pid={pid} hr={hr & 0xFFFFFFFF:#x}")
+                Commit(pps)
+            finally:
+                Release(pps)
+        except Exception as e:
+            _gui_log(f"панель задач: свойства окна не выставлены: {e}")
 
     def _f(self, size=13, w="normal"):
         return ctk.CTkFont("Segoe UI" if IS_WIN else "SF Pro Display", size, w)
