@@ -1,6 +1,50 @@
-"""Merge Chat — GUI v2.3"""
+"""Merge Chat — GUI"""
 import sys, os, threading, subprocess, re, platform, multiprocessing, json
 from pathlib import Path
+
+from app_paths import FROZEN, DATA_DIR, BASE_PKGS, LOCAL_PKGS, WHISPER_MODELS
+
+# ── Журнал GUI. Пишется с первой строки, до сторонних импортов: под pythonw
+# нет консоли, и падение на импорте раньше не оставляло следа вовсе —
+# лаунчер писал «Started OK», а окно так и не появлялось.
+_GUI_LOG = DATA_DIR / "merge_chat_gui.log"
+
+
+def _gui_log(msg: str):
+    try:
+        from datetime import datetime as _dt
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if _GUI_LOG.exists() and _GUI_LOG.stat().st_size > 1_000_000:
+            _GUI_LOG.replace(_GUI_LOG.with_suffix(".log.1"))
+        with open(_GUI_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{_dt.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except Exception:
+        pass
+
+
+def _fatal_start(what: str, exc: BaseException):
+    """Окно с причиной вместо молчаливой смерти. tkinter — из стандартной
+    библиотеки, он есть даже когда customtkinter не загрузился."""
+    import traceback
+    _gui_log(f"СТАРТ НЕ УДАЛСЯ: {what}\n" + "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    hint = ("Нет доступа к файлам программы — так бывает после установки "
+            "версии 2.9.1. Переустановите Merge Chat."
+            if isinstance(exc, PermissionError) else
+            "Переустановите Merge Chat.")
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        r = _tk.Tk()
+        r.withdraw()
+        _mb.showerror("Merge Chat",
+                      f"Не удалось запустить: {what}.\n\n{type(exc).__name__}: {exc}\n\n"
+                      f"{hint}\n\nПодробности: {_GUI_LOG}")
+        r.destroy()
+    except Exception:
+        pass
+    sys.exit(1)
+
 
 # ── Пакеты проги живут ВНУТРИ папки установки, а не в системном Python.
 # Две папки, потому что у них разная судьба:
@@ -12,24 +56,35 @@ from pathlib import Path
 # Раньше базовые ставились в системный Python (setup_base.bat без --target),
 # и удаление проги оставляло их там навсегда. Путь добавляем ДО первого
 # импорта стороннего пакета — иначе подхватится системная копия.
-_APP_DIR = Path(__file__).resolve().parent
-BASE_PKGS = _APP_DIR / "base_packages"
-LOCAL_PKGS = _APP_DIR / "local_packages"
-for _p in (BASE_PKGS, LOCAL_PKGS):
-    try:
-        _p.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+if not FROZEN:
+    for _p in (BASE_PKGS, LOCAL_PKGS):
+        try:
+            _p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        if str(_p) not in sys.path:
+            sys.path.insert(0, str(_p))
 
 try:
     import customtkinter as ctk
-except ImportError:
-    kw = {"creationflags": 0x08000000} if platform.system() == "Windows" else {}
-    subprocess.run([sys.executable, "-m", "pip", "install", "customtkinter", "-q"],
-                   check=False, **kw)
-    import customtkinter as ctk
+except ImportError as _e:
+    if FROZEN:
+        _fatal_start("в сборке нет customtkinter", _e)
+    # Пакета нет — доставляем туда же, в base_packages. Раньше этот запасной
+    # путь ставил customtkinter в СИСТЕМНЫЙ Python — мимо изоляции проги.
+    _gui_log(f"customtkinter не найден ({_e}) — ставлю в {BASE_PKGS}")
+    _kw = {"creationflags": 0x08000000} if platform.system() == "Windows" else {}
+    subprocess.run([sys.executable, "-m", "pip", "install", "--target", str(BASE_PKGS),
+                    "customtkinter", "-q"], check=False, **_kw)
+    try:
+        import importlib
+        importlib.invalidate_caches()
+        import customtkinter as ctk
+    except Exception as _e2:
+        _fatal_start("не загрузился customtkinter", _e2)
+except Exception as _e:
+    # PermissionError и прочее, что не ImportError: раньше не ловилось вовсе.
+    _fatal_start("не загрузился customtkinter", _e)
 
 IS_WIN = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
@@ -43,17 +98,18 @@ if IS_WIN:
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD as _TkDnD
     _HAS_DND = True
-except ImportError:
+except Exception as _e:        # не только ImportError: PermissionError тоже не повод падать
     _HAS_DND = False
     DND_FILES = None
+    if not isinstance(_e, ImportError):
+        _gui_log(f"tkinterdnd2 не загрузился: {type(_e).__name__}: {_e}")
 
 # BASE_PKGS / LOCAL_PKGS заданы в самом верху файла — до первого импорта
 # стороннего пакета, иначе customtkinter подтянулся бы из системного Python.
 
-# Модели Whisper (tiny…large .pt) храним внутри папки проги — whisper_models/,
-# а не в общем ~/.cache/whisper. Так удаление MergeChat уносит модели с собой.
-# См. правило изоляции служебных файлов (memory/feedback_isolate_app_files.md).
-WHISPER_MODELS = Path(__file__).resolve().parent / "whisper_models"
+# Модели Whisper (tiny…large .pt) храним внутри папки проги — whisper_models/
+# (WHISPER_MODELS из app_paths), а не в общем ~/.cache/whisper. Так удаление
+# MergeChat уносит модели с собой. См. memory/feedback_isolate_app_files.md.
 # Legacy-кэш: до v2.5 модели качались в общий ~/.cache/whisper — чистим его
 # при «Удалить Whisper», т.к. на старых установках там осели гигабайты.
 WHISPER_CACHE_LEGACY = Path.home() / ".cache" / "whisper"
@@ -66,6 +122,12 @@ WHISPER_CACHE_LEGACY = Path.home() / ".cache" / "whisper"
 # Python (в т.ч. в общем %APPDATA%\Python user-site) и баннер не показывался.
 def _whisper_available() -> bool:
     try:
+        if FROZEN:
+            # В сборке PyInstaller whisper лежит внутри бандла, local_packages
+            # нет вовсе. Раньше баннер «не установлен» тут врал, а «Установить»
+            # запускал вместо pip вторую копию самой программы.
+            import importlib.util
+            return importlib.util.find_spec("whisper") is not None
         return ((LOCAL_PKGS / "whisper").is_dir()
                 and (LOCAL_PKGS / "torch").is_dir())
     except Exception:
@@ -76,6 +138,36 @@ _WHISPER_OK = _whisper_available()
 # Расширения аудио — одно место для GUI (выбор файла, drag&drop, автодетект).
 _AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus",
                ".aac", ".flac", ".webm", ".amr", ".mp4"}
+
+
+def _canon_pkg(name: str) -> str:
+    """Имя пакета по PEP 503: openai_whisper == openai-whisper == OpenAI.Whisper."""
+    return re.sub(r"[-_.]+", "-", (name or "").strip()).lower()
+
+
+def _installed_versions(target: Path) -> dict:
+    """{имя: версия} пакетов в pip --target папке. Если у пакета несколько
+    *.dist-info (pip --target не чистит старые — см. CLAUDE_DEV), версию
+    не считаем известной: по метаданным не понять, чьи файлы лежат на диске."""
+    seen = {}
+    try:
+        for d in Path(target).glob("*.dist-info"):
+            name = ver = ""
+            try:
+                for line in (d / "METADATA").read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.startswith("Name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("Version:"):
+                        ver = line.split(":", 1)[1].strip()
+                    elif not line.strip():
+                        break
+            except Exception:
+                continue
+            if name and ver:
+                seen.setdefault(_canon_pkg(name), set()).add(ver)
+    except Exception:
+        return {}
+    return {n: next(iter(v)) for n, v in seen.items() if len(v) == 1}
 
 
 def _source_has_audio(path) -> bool:
@@ -303,16 +395,18 @@ def dl_fetch(item, cancel, on_bytes, on_log, conns=DL_CONNECTIONS,
     shown = [committed[0]]   # то, что уже показали пользователю
 
     def _tick(force=False):
-        now = time.time()
-        if force or now - last_ui[0] >= 0.2:
-            last_ui[0] = now
-            # Полоска не должна ехать назад. При обрыве куска мы честно
-            # откатываем счётчик (иначе повтор посчитает те же байты дважды),
-            # но показывать откат нельзя — пользователь читает это как сбой.
-            # Держим достигнутый максимум, пока загрузка его не догонит.
-            val = min(committed[0] + live[0], total)
-            shown[0] = max(shown[0], val)
-            on_bytes(shown[0], total)
+        # Зовётся из всех 8 потоков сразу — без блокировки счётчики гонялись.
+        with lock:
+            now = time.time()
+            if force or now - last_ui[0] >= 0.2:
+                last_ui[0] = now
+                # Полоска не должна ехать назад. При обрыве куска мы честно
+                # откатываем счётчик (иначе повтор посчитает те же байты дважды),
+                # но показывать откат нельзя — пользователь читает это как сбой.
+                # Держим достигнутый максимум, пока загрузка его не догонит.
+                val = min(committed[0] + live[0], total)
+                shown[0] = max(shown[0], val)
+                on_bytes(shown[0], total)
 
     on_bytes(committed[0], total)
 
@@ -502,7 +596,7 @@ _theme = "dark"  # единственная тема
 def T(key):
     return THEMES[_theme][key]
 
-VERSION = "2.9.1"
+VERSION = "2.9.2"
 AUTHOR  = "Смагин Артём"
 GITHUB  = "github.com/SmagArt/chat-merge"
 MAX_RECENT = 5
@@ -540,7 +634,27 @@ SCRIPT = find_script()
 _cancel_event = threading.Event()
 
 
+_NV_CACHE = {"v": None}
+
+
+def _prefetch_nvidia():
+    """Считаем заранее, в фоне: PowerShell стартует до нескольких секунд, и
+    клик «Установить» раньше замораживал окно на это время."""
+    def _bg():
+        try:
+            _has_nvidia()
+        except Exception:
+            pass
+    threading.Thread(target=_bg, daemon=True).start()
+
+
 def _has_nvidia():
+    if _NV_CACHE["v"] is None:
+        _NV_CACHE["v"] = _detect_nvidia()
+    return _NV_CACHE["v"]
+
+
+def _detect_nvidia():
     if not IS_WIN:
         return False
     # wmic удалён начиная с Windows 11 24H2 → powershell + CIM
@@ -567,12 +681,14 @@ class App(_BaseApp):
         ctk.CTk.__init__(self)
 
         global _theme
-        # Config always next to exe or script (not inside _MEIPASS — it is read-only)
-        if getattr(sys, "frozen", False):
-            cfg_dir = Path(sys.executable).parent
-        else:
-            cfg_dir = Path(__file__).resolve().parent
-        self._cfg_path = cfg_dir / "merge_chat_config.json"
+        # Конфиг — в DATA_DIR (app_paths): рядом со скриптами в {app}, рядом с
+        # .exe в сборке Windows, в Application Support на Mac. Не в _MEIPASS и
+        # не внутри .app — там только чтение и подпись бандла.
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._cfg_path = DATA_DIR / "merge_chat_config.json"
         self._cfg = self._load_cfg()
         _theme = self._cfg.get("theme", "dark")
         ctk.set_appearance_mode(_theme)
@@ -724,7 +840,13 @@ class App(_BaseApp):
         return w, h
 
     def _deferred_init(self):
-        self._build()
+        _prefetch_nvidia()
+        try:
+            self._build()
+        except Exception as e:
+            # Окно ещё скрыто (withdraw) — без этого процесс висел бы
+            # невидимкой и держал блокировку «уже запущена».
+            _fatal_start("не собрался интерфейс", e)
         self._update_model_status()
         self.update_idletasks()
         # Подгоняем окно по реальной требуемой высоте, гарантируя видимый лог.
@@ -877,7 +999,16 @@ class App(_BaseApp):
                 self.flbl.configure(text=f"Папка не найдена: {val}", text_color="#f87171")
 
     def _on_dnd_drop(self, event):
-        path = event.data.strip().strip("{}")
+        # tkdnd отдаёт список: «{C:/a b} C:/c». Раньше срезались только крайние
+        # скобки, и при перетаскивании нескольких файлов путь выходил битым.
+        # Берём первый элемент списка.
+        try:
+            items = self.tk.splitlist(event.data)
+        except Exception:
+            items = [event.data.strip().strip("{}")]
+        if not items:
+            return
+        path = str(items[0]).strip()
         p = Path(path)
         if p.is_dir():
             self.folder_var.set(path)
@@ -2064,7 +2195,7 @@ class App(_BaseApp):
             bar.set(max(0.0, min(1.0, pct)))
             stat_lbl.configure(
                 text=f"{pct*100:3.0f}%  ·  {_fmt_mb(done)} / {_fmt_mb(total)}"
-                     f"  ·  {spd/1024/1024:.1f} МБ/с  ·  осталось {_fmt_eta(left)}")
+                     f"  ·  {_fmt_speed(spd)}  ·  осталось {_fmt_eta(left)}")
             if gbar is not None:
                 gp = (gdone / gtotal) if gtotal else 0
                 gbar.set(max(0.0, min(1.0, gp)))
@@ -2175,8 +2306,10 @@ class App(_BaseApp):
 
     def _show_vk_fetch_dialog(self):
         vk_script = (SCRIPT.parent / "tools" / "vk_fetch_history.py") if SCRIPT else None
+        fetching = [False]    # пока идёт выгрузка — «Справка» и т.п. не сносят окно
         overlay, content, close = self._overlay(
-            "Выгрузить из ВКонтакте", width=620, height=560)
+            "Выгрузить из ВКонтакте", width=620, height=560,
+            busy=lambda: fetching[0])
 
         if not vk_script or not vk_script.exists():
             ctk.CTkLabel(content,
@@ -2309,61 +2442,65 @@ class App(_BaseApp):
             close_btn.configure(state="disabled")
             pbar.configure(mode="indeterminate"); pbar.start()
 
-            def run():
-                kw = {"creationflags": 0x08000000} if IS_WIN else {}
-                export_dir = vk_script.parent / "vk_export"
-                src_json = export_dir / f"{peer}.json"
-                # ВАЖНО: один peer_id у разных аккаунтов пишется в один файл и
-                # ДОПИСЫВАЕТСЯ → диалоги смешиваются. Чистим перед выгрузкой.
-                try:
-                    if src_json.exists():
-                        src_json.unlink()
-                        self.after(0, _append, "Старый vk_export очищен (избегаем смешивания).")
-                except Exception:
-                    pass
+            remember = (bool(rem_var.get()), tok_var.get().strip(), rem_label_var.get().strip())
+            fetching[0] = True
 
-                env = os.environ.copy()
-                # Прямой доступ к VK мимо прокси (Karing и т.п.)
-                env["NO_PROXY"] = ".vk.com,.vk.ru,.userapi.com," + env.get("NO_PROXY", "")
-                # requests лежит в base_packages проги, а не в Python: дочерний
-                # процесс без этого пути падал на import requests на любой
-                # машине, где requests нет в системном Python.
-                env["PYTHONPATH"] = os.pathsep.join(
-                    [str(BASE_PKGS)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
-                # Токен — через окружение, не аргументом: командную строку
-                # процесса видно в Диспетчере задач любому.
-                env["VK_TOKEN"] = token
-                ok = False
-                try:
-                    self.after(0, _append, f"Тяну диалог {peer}…")
-                    proc = subprocess.Popen(
-                        [sys.executable, str(vk_script), "--peer", str(peer)],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, encoding="utf-8", errors="replace",
-                        cwd=str(vk_script.parent), env=env, **kw)
-                    for line in proc.stdout:
-                        line = line.rstrip()
-                        if line:
-                            self.after(0, _append, line)
-                    proc.wait()
-                    ok = (proc.returncode == 0 and src_json.exists())
-                except Exception as e:
-                    self.after(0, _append, f"Ошибка запуска: {e}")
-                    ok = False
-
-                if ok:
+            def ui(fn, *a):
+                """В main-thread и молча, если окно выгрузки уже закрыли."""
+                def call():
                     try:
-                        import shutil
-                        target_dir = Path(dst) / f"VK_{peer}"
-                        target_dir.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(src_json, target_dir / f"{peer}.json")
-                        self.after(0, _append, f"Готово → {target_dir}\\{peer}.json")
-                        self.after(0, self._vk_fetch_done, str(target_dir),
-                                   bool(rem_var.get()), tok_var.get().strip(),
-                                   rem_label_var.get().strip())
-                    except Exception as e:
-                        self.after(0, _append, f"Скачано, но не скопировалось: {e}")
-                        ok = False
+                        if overlay.winfo_exists():
+                            fn(*a)
+                    except Exception:
+                        pass
+                self.after(0, call)
+
+            bar_determinate = [False]
+
+            def _progress(done, total):
+                if not bar_determinate[0]:          # первая страница — бегунок → проценты
+                    bar_determinate[0] = True
+                    pbar.stop(); pbar.configure(mode="determinate")
+                pbar.set(min(1.0, done / total) if total else 0)
+
+            def run():
+                # Выгрузка — в этом же процессе, модулем, а не дочерним Python:
+                # раньше дочерний процесс не видел base_packages (import requests
+                # падал), а в сборке PyInstaller sys.executable — сама программа.
+                # Сессия скрипта ходит в VK мимо прокси (trust_env=False).
+                ok = False
+                target_dir = Path(dst) / f"VK_{peer}"
+                out_json = target_dir / f"{peer}.json"
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location(
+                        "mergechat_vk_fetch", str(vk_script))
+                    vkmod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(vkmod)
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    # Пишем сразу в папку назначения. Старый файл удаляем:
+                    # save_dialog ДОПИСЫВАЕТ к существующему, а один peer_id у
+                    # разных аккаунтов — разные диалоги, они бы смешались.
+                    vkmod.OUT_DIR = target_dir
+                    if out_json.exists():
+                        out_json.unlink()
+                        ui(_append, "Старая выгрузка удалена (чтобы не смешались аккаунты).")
+                    ui(_append, f"Тяну диалог {peer}…")
+                    messages, names = vkmod.fetch_messages(
+                        peer, token, progress=lambda d, t: ui(_progress, d, t))
+                    info = vkmod.peer_info(peer, token, names)
+                    vkmod.save_dialog(peer, info, messages, names)
+                    ok = out_json.exists()
+                    ui(_append, f"{_plural(len(messages), ('сообщение', 'сообщения', 'сообщений'))}"
+                                f"{' · ' + info['name'] if info.get('name') else ''}")
+                    ui(_append, f"Готово → {out_json}")
+                except Exception as e:
+                    ui(_append, f"Ошибка: {e}")
+                    ok = False
+                fetching[0] = False
+                if ok:
+                    # Папку ставим источником, даже если окно выгрузки закрыли.
+                    self.after(0, self._vk_fetch_done, str(target_dir), *remember)
 
                 def finish():
                     pbar.stop(); pbar.configure(mode="determinate")
@@ -2373,7 +2510,7 @@ class App(_BaseApp):
                         go_btn.configure(text="✓ Готово", fg_color=T("GREEN"), state="disabled")
                     else:
                         go_btn.configure(text="Повторить", state="normal")
-                self.after(0, finish)
+                ui(finish)
 
             threading.Thread(target=run, daemon=True).start()
 
@@ -2453,6 +2590,12 @@ class App(_BaseApp):
         return "torch" in sys.modules or "whisper" in sys.modules
 
     def _show_install_dialog(self):
+        if FROZEN:
+            self._overlay_message(
+                "Установка Whisper",
+                "В этой сборке движок ставится вместе с программой — "
+                "отдельная установка через pip здесь невозможна.")
+            return
         if getattr(self, "_engine_dl_active", False):
             self._overlay_message(
                 "Установка Whisper",
@@ -2518,6 +2661,23 @@ class App(_BaseApp):
 
             log("В плане " + _plural(len(plan), ("пакет", "пакета", "пакетов")))
 
+            # Та же версия уже стоит — не качаем заново. План строится с
+            # --ignore-installed, и раньше «Обновить» перекачивал все 2.6 ГБ
+            # даже тогда, когда обновлять было нечего.
+            have = _installed_versions(LOCAL_PKGS)
+            todo = [(n, v, u) for n, v, u in plan if have.get(_canon_pkg(n)) != v]
+            if not todo:
+                if _whisper_available():
+                    log("Все пакеты уже нужных версий.")
+                    self.after(0, self._on_whisper_installed, True)
+                    finish(True, "Уже стоит последняя версия — обновлять нечего.")
+                    return
+                todo = plan      # метаданные есть, а самих whisper/torch нет — ставим всё
+            if len(todo) < len(plan):
+                log(f"Уже на месте: {len(plan) - len(todo)}, качаю "
+                    + _plural(len(todo), ("пакет", "пакета", "пакетов")))
+            plan = todo
+
             # ── 2. Качаем колёса своим загрузчиком ──
             items = []
             for name, ver, url in plan:
@@ -2562,6 +2722,7 @@ class App(_BaseApp):
                 # Колёса больше не нужны — это ещё столько же гигабайт на диске.
                 import shutil
                 shutil.rmtree(wheels_dir, ignore_errors=True)
+                self._reset_acl_if_elevated(LOCAL_PKGS, log, kw)
             self.after(0, self._on_whisper_installed, ok)
             finish(ok,
                    "Готово. Голосовые будут расшифровываться сразу, "
@@ -2571,6 +2732,27 @@ class App(_BaseApp):
 
         self._engine_dl_active = True
         threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _reset_acl_if_elevated(path, log, kw):
+        """Прога запущена с правами администратора → pip на Python 3.13 оставил
+        пакетам ACL «только Администраторы» (mkdtemp 0o700 + перенос в target).
+        Тогда обычный запуск получит PermissionError на import torch. Возвращаем
+        наследуемые права. Без повышения файлы и так наши — пропускаем."""
+        if not IS_WIN:
+            return
+        try:
+            import ctypes
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                return
+        except Exception:
+            return
+        log("Прога запущена от администратора — выравниваю права на файлы движка…")
+        try:
+            subprocess.run(["icacls", str(path), "/reset", "/T", "/C", "/Q"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+        except Exception as e:
+            log(f"icacls не отработал: {e}")
 
     def _pip_install_fallback(self, has_nv, log, kw):
         """Запасной путь, если план через --report не сложился: обычный pip.
@@ -2852,18 +3034,19 @@ class App(_BaseApp):
             ("🚀  Быстрый старт",
              "1. Перетащи папку с перепиской в окно (или «Выбрать…»).\n"
              "2. Введи своё имя как в мессенджере.\n"
-             "3. Жми «▶ Запустить». Готовый файл появится рядом с папкой."),
+             "3. Жми «Запустить». Готовый файл появится в этой же папке."),
             ("📁  Откуда брать переписки",
              "Telegram → Настройки → Экспорт данных, формат JSON. Скармливай папку чата (с result.json).\n"
              "ВКонтакте (HTML) → vk.com/data_protection → запросить, распаковать. Внутри messages/<ID>/ — нужный диалог.\n"
-             "ВКонтакте (быстро, через API) → tools/vk_fetch_history.py: сначала --list (узнать peer_id),\n"
-             "   потом --peer <id>. Папку tools/vk_export/ скармливай как обычно.\n"
+             "ВКонтакте (быстро, через API) → кнопка «⬇ Выгрузить из ВК» в шапке: токен + peer_id,\n"
+             "   папка с выгрузкой сразу станет источником.\n"
              "Instagram → instagram.com/accounts/your_data → формат JSON, распаковать.\n"
-             "WhatsApp → в чате ⋮ → Ещё → Экспорт чата (С медиа). Распаковать ZIP."),
+             "WhatsApp (iPhone и Android) → в чате ⋮ → Ещё → Экспорт чата (С медиа). Распаковать ZIP."),
             ("🎙  Расшифровка голосовых",
-             "Whisper работает офлайн, без облаков. Один раз поставь через жёлтый банннер.\n"
+             "Whisper работает офлайн, без облаков. Один раз поставь через жёлтый баннер.\n"
              "На NVIDIA — автоматически встанет CUDA-версия (быстрая).\n"
-             "Кэш расшифровок сохраняется рядом — повторный запуск пропускает уже сделанные файлы."),
+             "Расшифровки запоминаются в папке переписки (.transcribe_cache.json): повторный запуск\n"
+             "той же моделью не переделывает готовые — в том числе после отмены."),
             ("🏷  Метки источников",
              "Если в одной папке несколько мессенджеров (TG+VK+IG+WA одного контакта), включи 🏷 [TG] —\n"
              "будет видно, откуда каждое сообщение."),
@@ -2943,7 +3126,15 @@ class App(_BaseApp):
 
         wrow = ctk.CTkFrame(content, fg_color="transparent")
         wrow.pack(pady=(10, 0))
-        if self._whisper_installed:
+        if FROZEN:
+            # Сборка PyInstaller: движок внутри бандла, pip нет — sys.executable
+            # тут сама программа. Кнопки ставить/удалять запускали бы её копию.
+            ctk.CTkLabel(wrow, text=("✓ Whisper встроен в сборку" if self._whisper_installed
+                                     else "○ В этой сборке Whisper нет"),
+                         font=self._f(11),
+                         text_color=T("GREEN") if self._whisper_installed else T("SUB")
+                         ).pack(side="left")
+        elif self._whisper_installed:
             ctk.CTkLabel(wrow, text="✓ Whisper установлен", font=self._f(11),
                          text_color=T("GREEN")).pack(side="left", padx=(0, 10))
             ctk.CTkButton(wrow, text="Обновить", width=100, height=28, font=self._f(11),
@@ -2971,6 +3162,17 @@ class App(_BaseApp):
                       fg_color=T("MUTED"), hover_color=T("BORDER"),
                       text_color=T("SUB"), corner_radius=8,
                       command=close).pack(side="bottom", pady=(8, 0))
+
+    def report_callback_exception(self, exc, val, tb):
+        """Исключение в обработчике кнопки/after. Под pythonw Tk печатал его в
+        stderr=None — то есть никуда: кнопка просто «не работала». Теперь — в
+        журнал GUI и строкой в лог окна."""
+        import traceback
+        _gui_log("Ошибка в интерфейсе:\n" + "".join(traceback.format_exception(exc, val, tb)))
+        try:
+            self._log(f"[!] Внутренняя ошибка интерфейса: {val}  (подробности — {_GUI_LOG})")
+        except Exception:
+            pass
 
     def _log(self, msg):
         if IS_WIN:
@@ -3246,9 +3448,15 @@ class App(_BaseApp):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    _gui_log(f"=== start v{VERSION} · Python {sys.version.split()[0]} · "
+             f"customtkinter {getattr(ctk, '__version__', '?')} · exe={sys.executable}")
     if not _acquire_lock():
         import tkinter as tk; from tkinter import messagebox
         root = tk.Tk(); root.withdraw()
         messagebox.showwarning("Merge Chat", "Программа уже запущена!")
         root.destroy(); sys.exit(0)
-    app = App(); app.mainloop()
+    try:
+        app = App()
+    except Exception as _e:
+        _fatal_start("не собралось главное окно", _e)
+    app.mainloop()

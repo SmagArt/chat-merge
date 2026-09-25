@@ -1,4 +1,4 @@
-# CLAUDE.md — Merge Chat v2.8
+# CLAUDE.md — Merge Chat v2.9.2
 
 ## Контекст
 Python GUI: объединяет переписки **Telegram** (JSON/HTML), **VK** (HTML-архив + API-JSON через `tools/vk_fetch_history.py`), **Instagram** (JSON), **WhatsApp** (TXT) в TXT/MD. Расшифровывает голосовые через OpenAI Whisper офлайн. GPU-ускорение: NVIDIA CUDA, Apple Silicon MPS.
@@ -19,7 +19,9 @@ GitHub: github.com/SmagArt/chat-merge
 | v2.5   | собран локально 26.04.2026 (UI lift, имена в выводе, пресеты, изоляция Whisper) |
 | v2.6   | VK API-JSON (`vk_export`) внесён в установщик; пересланные разворачиваются |
 | v2.7   | собран 11.06.2026: кнопка «⬇ Выгрузить из ВК» в GUI + `vk_fetch.bat` + фикс высоты окна/лога; имя установщика без `_admin` |
-| **v2.8** | собран 18.06.2026: управление моделями кнопками (скачать/удалить, отражается на диске), многопоточная загрузка моделей (8 соединений, ~×3), проверка SHA256, статус модели по целостности (не по факту файла), кнопка «Обновить Whisper». **Текущая** |
+| v2.8   | собран 18.06.2026: управление моделями кнопками (скачать/удалить, отражается на диске), многопоточная загрузка моделей (8 соединений, ~×3), проверка SHA256, статус модели по целостности (не по факту файла), кнопка «Обновить Whisper» |
+| v2.9 / 2.9.1 | 10–11.09.2026: пакеты проги в `{app}\base_packages` / `local_packages`, единый загрузчик, 403 на torch (UA). **2.9.1 после установки не запускается** — см. «Фиксы 2026-09-25» |
+| **v2.9.2** | 25.09.2026: полный аудит — ACL `base_packages`, лог и окно ошибки старта, кэш расшифровок, IG/WA/TG HTML, дубли VK/TG, стек оверлеев, удаление бандленого Python. **Текущая** |
 | v3.0   | backlog: миграция UI на PySide6 (см. `memory/project_chat_merge_qt_migration.md`) |
 
 **Установщик один** (`installer_windows.iss`, bundled Python, права администратора). Прежнее
@@ -103,9 +105,41 @@ medium на GPU (TTS-голосовые + кружочек).
   по `self._whisper_installed`, а не по снимку при старте; однопоточный режим загрузчика качает
   весь файл и пишет по ходу чтения; «Обновить/Удалить Whisper» при torch в памяти — просят
   перезапуск; путь результата — из возвращаемого значения, не из строки лога.
-- **Выгрузка ВК:** `tools/vk_fetch_history.py` сам добавляет `base_packages` в `sys.path`
-  (дочерний процесс не видел `requests`), токен — через `VK_TOKEN` в env, не аргументом.
 - **Деинсталлятор** не спрашивает про «системный Python», если записан бандл из `{app}`.
+
+### Вторая партия (v2.9.2)
+
+- **2.9.1 после установки НЕ ЗАПУСКАЛАСЬ.** `setup_base.bat` идёт из повышенного Inno, pip
+  на Python 3.13 переносит пакеты из `mkdtemp` (ACL «владелец+СИСТЕМА+Администраторы», без
+  наследования) — владелец «Администраторы», обычный запуск ловит `PermissionError` на
+  `customtkinter/__init__.py`, а GUI ловил только `ImportError` → смерть молча под pythonw.
+  Лечение: `icacls base_packages /reset /T` в `setup_base.bat`; GUI после своего pip тоже
+  сбрасывает ACL, если запущен повышенным. Разбор — `Knowledge/CLAUDE_DEV.md`, «Принцип установки».
+- **Журнал и окно ошибки старта:** `merge_chat_gui.log` с первой строки, `_fatal_start()` —
+  messagebox на голом tkinter; `report_callback_exception` пишет ошибки кнопок в журнал и лог.
+- **Пути — `app_paths.py`** (CODE_DIR/DATA_DIR): на Windows всё по-прежнему в `{app}`; в сборке
+  macOS конфиг/модели/логи — `~/Library/Application Support/MergeChat`, не внутрь `.app`.
+- **Кэш расшифровок на диске:** `<папка>/.transcribe_cache.json`, ключ модель+относительный
+  путь+размер. README и «Справка» обещали его давно, а не было.
+- **Отмена во время файла** теперь дожидается его (как и пишет кнопка). Раньше поток
+  бросался и крутил модель в фоне → вторая модель на GPU при быстром перезапуске.
+- **Выгрузка ВК — в процессе GUI модулем**, а не дочерним Python (в сборке `sys.executable` —
+  сама прога). Пишет сразу в `<папка>/VK_<peer>/`. В скрипте: `--list` показывал пустые имена
+  (profiles/groups — на уровне ответа, не диалога), не-JSON ответ ронял, у бесед нет названия,
+  дубли при съезде offset.
+- **TG HTML:** автор — только прямой `from_name` у body (у joined с пересылкой брался автор
+  оригинала), дата внутри `from_name` пересланного не склеивается с именем, автор запоминается и
+  у отброшенных сообщений (опрос/гео), карта цитат общая на все `messagesN.html`.
+- **WA:** звонок/«медиа отсутствует» — только если это вся служебная строка.
+- **Установщик:** удаляет бандленый Python при деинсталляции — только если `{app}\python`
+  есть, `PythonCore\3.13\InstallPath` ведёт внутрь `{app}` и ключ «Python 3.13.2 (64-bit)» один;
+  `PrepareToInstall` отказывает, если UAC дал права ДРУГОЙ учётки (прога встала бы в её профиль).
+- **Сборка macOS:** версия из `VERSION`, в бандл — `bs4`/`requests`/`certifi`/`tools/`,
+  frozen-режим без pip-кнопок; `.gitattributes` держит `*.command` в LF (папка едет на Mac через
+  Google Drive, bash с CRLF падает). Сама сборка на Mac после этого не проверялась.
+- Мелочи: drag&drop нескольких файлов, `mkstemp` вместо `mktemp`, `find_file` с `glob.escape`,
+  лаунчер проверяет Program Files, скорость в МБ/с, NVIDIA-детект в фоне, гонка счётчиков
+  загрузчика, `message_*.json` без цифр.
 
 ---
 
@@ -115,6 +149,8 @@ medium на GPU (TTS-голосовые + кружочек).
 |------|-----------|
 | `merge_chat.py` | Логика: парсеры, merge, Whisper, `process_folder()` / `process_audio()` |
 | `merge_chat_gui.py` | GUI на CustomTkinter |
+| `app_paths.py` | Пути: где код (CODE_DIR) и куда прога пишет (DATA_DIR) — одно место для GUI, логики и сборки |
+| `.gitattributes` | `*.command` / `*.sh` — всегда LF (папка синкается на Mac через Google Drive) |
 | `installer_windows.iss` | Inno Setup (bundled Python 3.13.2, ставит Python в `{app}\python`; требует прав администратора) |
 | `setup_base.bat` | Установка базовых pip-пакетов после Inno |
 | `setup_whisper.bat` | Ручная установка Whisper + torch в `{app}\local_packages\` (legacy-скрипт, не вызывается автоматически; основной путь — кнопка «Установить» в окне «О программе») |
@@ -125,14 +161,14 @@ medium на GPU (TTS-голосовые + кружочек).
 | `merge_chat.ico` / `merge_chat.icns` / `merge_chat_1024.png` | Иконки |
 | `requirements.txt` | Зависимости |
 | `python-installer/python-3.13.2-amd64.exe` | Бандл Python для Inno (скачать вручную при сборке на новой машине, см. ниже) |
-| `dist_installer/MergeChat_Setup_v2.8.exe` | Готовый Windows-инсталлятор |
+| `dist_installer/MergeChat_Setup_vX.Y.Z.exe` | Готовый Windows-инсталлятор (не в git) |
 | `README.md` | Документация пользователя |
 
 ---
 
 ## Сборка
 
-### Windows (MergeChat_Setup_v2.8.exe)
+### Windows (MergeChat_Setup_vX.Y.Z.exe)
 1. На новой машине — один раз скачать Python-бандл:
    ```
    powershell -Command "Invoke-WebRequest 'https://www.python.org/ftp/python/3.13.2/python-3.13.2-amd64.exe' -OutFile 'python-installer\python-3.13.2-amd64.exe'"
@@ -141,14 +177,15 @@ medium на GPU (TTS-голосовые + кружочек).
    (или из CLI: `"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer_windows.iss`)
 3. Готовый файл — в `dist_installer/`.
 
-### macOS (MergeChat_v2.5.dmg)
+### macOS (MergeChat_vX.Y.Z.dmg)
 ```bash
 bash build_mac.command
 ```
-Соберёт `.app` через PyInstaller + DMG со ссылкой на `/Applications`.
+Соберёт `.app` через PyInstaller + DMG со ссылкой на `/Applications`. Версия в имени DMG
+берётся из `VERSION` в `merge_chat_gui.py`.
 
 ### Версионирование
-При смене версии правим: `merge_chat_gui.py` (`VERSION`), `installer_windows.iss` (`AppVersion`), `build_mac.command` (имя DMG), `README.md`, `CLAUDE.md`.
+При смене версии правим: `merge_chat_gui.py` (`VERSION`), `installer_windows.iss` (`AppVersion`), `README.md`, `CLAUDE.md`. `build_mac.command` берёт версию сам.
 
 ---
 
@@ -285,8 +322,9 @@ _subp.run = _run_hidden
 
 ## Pending
 
-- [ ] Mac DMG v2.8 пересобрать на Mac Mini M4 (`bash build_mac.command`)
-- [ ] GitHub Release v2.8 (Windows .exe + Mac .dmg + source)
+- [ ] Mac DMG v2.9.2 собрать на Mac Mini M4 (`bash build_mac.command`) и прогнать: старт, Whisper встроен, выгрузка ВК, конфиг/модели в Application Support
+- [ ] GitHub Release v2.9.2 (Windows .exe + Mac .dmg + source)
+- [ ] Удаление бандленого Python деинсталлятором проверить на чистой машине (на машинах Артёма стоит свой Python 3.13.12 — бандл там не ставится)
 - [ ] (backlog v3.0) Миграция UI на PySide6 — см. `memory/project_chat_merge_qt_migration.md`. PyInstaller заодно решит «pythonw.exe в Диспетчере задач».
 
 ---
@@ -298,7 +336,7 @@ _subp.run = _run_hidden
 3. «Справка» в шапке → оверлей со скроллом.
 4. Hover на любой `?` → tooltip справа от виджета, 2-4 строки, без реальных имён.
 5. «Выбрать…» → оверлей по центру (не отдельное окно ОС).
-6. Жёлтый банннер «Установить Whisper» → оверлей установки тоже встроен.
+6. Жёлтый баннер «Установить Whisper» → оверлей установки тоже встроен.
 7. Пресеты «Диалог»/«Группа»/«Канал» переключают связку настроек.
 8. «Дополнительно: разные имена для вывода» — раскрывает поля `my_display` / `peer_display`, скрытие очищает значения.
 9. «О программе» → открывается карточкой без затемнения, ссылка на GitHub кликабельна.

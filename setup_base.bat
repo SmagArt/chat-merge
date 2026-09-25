@@ -54,6 +54,14 @@ REM an unpinned major bump would break the UI silently on a future install.
 set "RC=!ERRORLEVEL!"
 echo %DATE% %TIME% base packages exit=!RC! >> "%LOGFILE%"
 
+REM Reset ACLs to inherited. Python 3.13 tempfile.mkdtemp gives pip's temp
+REM dir an explicit "owner only" ACL, and pip moves packages out of it with
+REM that ACL intact. Under the elevated installer the owner is the
+REM Administrators group, so a normal (non-elevated) launch got
+REM PermissionError on customtkinter and the window never opened.
+icacls "!BASEPKGS!" /reset /T /C /Q >> "%LOGFILE%" 2>&1
+echo %DATE% %TIME% icacls reset exit=!ERRORLEVEL! >> "%LOGFILE%"
+
 REM Verify the import comes FROM base_packages, not from the system Python:
 REM an old system-wide customtkinter would otherwise mask a failed install.
 "!PY!" -c "import sys; sys.path.insert(0, r'!BASEPKGS!'); import customtkinter, bs4, tkinterdnd2; print('base packages OK')" >> "%LOGFILE%" 2>&1

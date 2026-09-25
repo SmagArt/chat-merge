@@ -1,0 +1,4 @@
+# Скрипты для macOS/Linux — всегда LF, даже в рабочей копии на Windows:
+# папка синкается на Mac через Google Drive, а bash с CRLF падает на \r.
+*.command text eol=lf
+*.sh text eol=lf

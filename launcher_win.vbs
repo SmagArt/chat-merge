@@ -43,7 +43,8 @@ If py = "" Then
     t(3)=u&"\AppData\Local\Programs\Python\Python310\python.exe"
     t(4)="C:\Program Files\Python313\python.exe"
     t(5)="C:\Program Files\Python312\python.exe"
-    Dim j : For j=0 To 3
+    ' To 5: t(4), t(5) - Program Files; with "To 3" they were never checked
+    Dim j : For j=0 To 5
         If fso.FileExists(t(j)) And py="" Then py=t(j) : Log "system: "&py
     Next
 End If
@@ -97,4 +98,6 @@ Dim pyW : pyW = Replace(py, "python.exe", "pythonw.exe")
 If Not fso.FileExists(pyW) Then pyW = py
 Log "Launch: " & S(pyW) & " " & S(gui)
 WshShell.Run S(pyW) & " " & S(gui), 0, False
-Log "Started OK"
+' Run(..., False) does not wait: this only means "process spawned". Whether the
+' window really opened is logged by the GUI itself in merge_chat_gui.log.
+Log "Launched (GUI start is logged in merge_chat_gui.log)"

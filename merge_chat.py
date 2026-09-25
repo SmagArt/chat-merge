@@ -38,10 +38,20 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
+# Пути — из app_paths (одно место для GUI и CLI). Запасной вариант — если
+# merge_chat.py скопировали отдельно, без app_paths.py: всё рядом со скриптом.
+try:
+    from app_paths import DATA_DIR as _DATA_DIR, BASE_PKGS as _base_pkgs, \
+        LOCAL_PKGS as _LOCAL_PKGS, WHISPER_MODELS as _WHISPER_MODELS
+except ImportError:
+    _DATA_DIR = Path(__file__).resolve().parent
+    _base_pkgs = _DATA_DIR / "base_packages"
+    _LOCAL_PKGS = _DATA_DIR / "local_packages"
+    _WHISPER_MODELS = _DATA_DIR / "whisper_models"
+
 # Базовые пакеты проги лежат в {app}\base_packages, а не в системном Python.
 # Путь нужен ДО импорта bs4, иначе при чистом системном Python модуль не
 # найдётся. (whisper/torch подключаются ниже, отдельно — они в local_packages.)
-_base_pkgs = Path(__file__).resolve().parent / "base_packages"
 if _base_pkgs.is_dir() and str(_base_pkgs) not in sys.path:
     sys.path.insert(0, str(_base_pkgs))
 
@@ -56,27 +66,27 @@ _warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
 
 
 # Fix SSL certificates on macOS (Python from python.org)
-import ssl as _ssl
 import os as _os
 
 def _fix_ssl():
+    # Python с python.org на macOS приходит без корневых сертификатов — даём
+    # ему certifi (он ставится с прогой и вшит в сборку). Раньше здесь же на
+    # macOS глобально ОТКЛЮЧАЛАСЬ проверка сертификатов для всего процесса —
+    # любую загрузку можно было подменить по дороге. С certifi это не нужно.
     try:
         import certifi
         _os.environ['SSL_CERT_FILE']      = certifi.where()
         _os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
     except ImportError:
         pass
-    # Отключаем верификацию SSL только на macOS (Python from python.org)
-    import sys as _sysssl
-    if _sysssl.platform == "darwin":
-        _ssl._create_default_https_context = _ssl._create_unverified_context
 
 _fix_ssl()
 
 # ── Логирование в файл ──────────────────────────────────
 import logging as _logging
 try:
-    _log_path = Path(__file__).parent / "merge_chat.log"
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _log_path = _DATA_DIR / "merge_chat.log"
     _logging.basicConfig(
         filename=str(_log_path),
         level=_logging.INFO,
@@ -207,15 +217,14 @@ if _meipass_pre and _meipass_pre not in _sys_pre.path:
     _sys_pre.path.insert(0, _meipass_pre)
 # Локальная папка с Whisper/torch — лежит рядом с merge_chat.py.
 # Должна попасть в sys.path ДО импорта whisper, иначе подтянется системный.
-from pathlib import Path as _PathPre
-_app_dir_pre = _PathPre(__file__).resolve().parent
-_local_pkgs_pre = _app_dir_pre / "local_packages"
+_local_pkgs_pre = _LOCAL_PKGS
 if _local_pkgs_pre.is_dir() and str(_local_pkgs_pre) not in _sys_pre.path:
     _sys_pre.path.insert(0, str(_local_pkgs_pre))
 
 # Модели Whisper качаем ВНУТРЬ папки проги (whisper_models/), а не в общий
-# ~/.cache/whisper — чтобы удаление MergeChat уносило их с собой.
-WHISPER_DOWNLOAD_ROOT = _app_dir_pre / "whisper_models"
+# ~/.cache/whisper — чтобы удаление MergeChat уносило их с собой. В сборке
+# для Mac это Application Support (см. app_paths) — не внутрь .app.
+WHISPER_DOWNLOAD_ROOT = _WHISPER_MODELS
 
 # Whisper берём ТОЛЬКО из local_packages самой проги (или из _MEIPASS в frozen-
 # сборке). Системный / пользовательский whisper (voice-diarizer, pip --user,
@@ -224,7 +233,7 @@ WHISPER_DOWNLOAD_ROOT = _app_dir_pre / "whisper_models"
 # Whisper. Нет его в local_packages → расшифровка выключится с понятным
 # сообщением, пользователь поставит Whisper через GUI («О программе»).
 _whisper_owned = (_local_pkgs_pre / "whisper").is_dir() or bool(_meipass_pre)
-del _sys_pre, _meipass_pre, _PathPre, _app_dir_pre, _local_pkgs_pre
+del _sys_pre, _meipass_pre, _local_pkgs_pre
 
 if _whisper_owned:
     try:
@@ -257,6 +266,78 @@ _loaded_model_name: str = ""   # name of currently loaded whisper model
 _voice_counter = {"done": 0, "total": 0}
 _transcribe_cache: dict = {}   # path -> text (deduplicate same file)
 _cancel_event = None           # set by GUI to interrupt processing
+
+
+# ──────────────────────────────────────────────
+#  Кэш расшифровок на диске
+# ──────────────────────────────────────────────
+# README и «Справка» обещали: «повторный запуск пропустит уже расшифрованные
+# файлы». Кэша при этом не было — только в памяти одного запуска, и тот
+# чистился перед каждым. Теперь: <папка переписки>/.transcribe_cache.json.
+# Ключ — модель + путь ОТНОСИТЕЛЬНО папки + размер: переезд папки кэш не
+# ломает, другая модель — другая расшифровка. Пустые/упавшие не сохраняем.
+_DISK_CACHE_NAME = ".transcribe_cache.json"
+_disk_cache = {"root": None, "path": None, "data": {}, "dirty": 0}
+
+
+def _cache_open(root: Path):
+    _cache_flush()
+    root = Path(root).resolve()
+    p = root / _DISK_CACHE_NAME
+    data = {}
+    try:
+        if p.exists():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and isinstance(raw.get("entries"), dict):
+                data = {str(k): str(v) for k, v in raw["entries"].items() if v}
+    except Exception as e:
+        _log_error(f"transcribe cache read {p}: {e}")
+    _disk_cache.update(root=root, path=p, data=data, dirty=0)
+
+
+def _cache_key(file_path: Path) -> Optional[str]:
+    root = _disk_cache["root"]
+    if root is None:
+        return None
+    try:
+        fp = Path(file_path).resolve()
+        try:
+            rel = fp.relative_to(root).as_posix()
+        except ValueError:
+            rel = fp.as_posix()
+        return f"{CFG.whisper_model}|{rel}|{fp.stat().st_size}"
+    except Exception:
+        return None
+
+
+def _cache_get(file_path: Path) -> Optional[str]:
+    k = _cache_key(file_path)
+    return _disk_cache["data"].get(k) if k else None
+
+
+def _cache_put(file_path: Path, text: Optional[str]):
+    k = _cache_key(file_path)
+    if not k or not text:
+        return
+    _disk_cache["data"][k] = text
+    _disk_cache["dirty"] += 1
+    if _disk_cache["dirty"] >= 10:      # сбрасываем пачками — отмена не теряет много
+        _cache_flush()
+
+
+def _cache_flush():
+    p = _disk_cache["path"]
+    if not p or not _disk_cache["dirty"]:
+        return
+    try:
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps({"version": 1, "entries": _disk_cache["data"]},
+                                  ensure_ascii=False), encoding="utf-8")
+        tmp.replace(p)
+        _disk_cache["dirty"] = 0
+    except Exception as e:           # папка только для чтения — живём без кэша
+        _log_error(f"transcribe cache write {p}: {e}")
+        _disk_cache["dirty"] = 0
 
 
 # ──────────────────────────────────────────────
@@ -333,7 +414,9 @@ def _progress_bar(done: int, total: int, w: int = 25) -> str:
     return f"[{'█'*fill}{'░'*(w-fill)}] {done}/{real_total} ({pct*100:.0f}%)"
 
 
-def transcribe(file_path: Path) -> Optional[str]:
+def transcribe(file_path: Path, cache_as: Optional[Path] = None) -> Optional[str]:
+    """cache_as — под каким файлом класть в кэш на диске (у кружочка это сам
+    .mp4, а расшифровывается временный .wav со случайным именем)."""
     if CFG.skip_transcribe:
         return None  # first-pass mode: no transcription
     if not CFG.use_whisper or not file_path or not file_path.exists():
@@ -346,6 +429,14 @@ def transcribe(file_path: Path) -> Optional[str]:
     cache_key = str(file_path.resolve())
     if cache_key in _transcribe_cache:
         return _transcribe_cache[cache_key]
+
+    _disk_hit = _cache_get(cache_as or file_path)
+    if _disk_hit:
+        _voice_counter["done"] += 1
+        print(f"  [{_voice_counter['done']}/{_voice_counter['total']}] "
+              f"Transcribing (из кэша): {Path(cache_as or file_path).name[:30]}")
+        _transcribe_cache[cache_key] = _disk_hit
+        return _disk_hit
 
     global _whisper_cache, _loaded_model_name
     try:
@@ -482,13 +573,17 @@ def transcribe(file_path: Path) -> Optional[str]:
 
         _t = _thr.Thread(target=_do_transcribe, daemon=True)
         _t.start()
-        # Wait with cancel polling every 0.3s
+        # Отмена во время файла: ДОЖИДАЕМСЯ его (так и обещает кнопка — «текущий
+        # файл будет дораспознан, дальше пропуск»; мгновенный выход — второй клик).
+        # Раньше тут был return: поток продолжал крутить модель в фоне, память
+        # не освобождалась, а следующий запуск грузил вторую модель рядом — на
+        # 8-гиговой видеокарте две medium уже не влезают.
+        _announced = False
         while _t.is_alive():
             _t.join(timeout=0.3)
-            if _cancel_event and _cancel_event.is_set():
-                # Thread still running but we skip this file
-                print(f"  [!] Transcription cancelled: {name}")
-                return None
+            if not _announced and _cancel_event and _cancel_event.is_set():
+                print(f"  [!] Отмена: дорасшифровываю текущий файл ({name}), остальные пропущу")
+                _announced = True
 
         if _exc_box[0] is not None:
             # MPS NaN fallback: Apple Silicon MPS sometimes produces NaN even in fp32.
@@ -512,10 +607,7 @@ def transcribe(file_path: Path) -> Optional[str]:
                     _use_fp16 = False
                     _t2 = _thr.Thread(target=_do_transcribe, daemon=True)
                     _t2.start()
-                    while _t2.is_alive():
-                        _t2.join(timeout=0.3)
-                        if _cancel_event and _cancel_event.is_set():
-                            return None
+                    _t2.join()          # как и выше: текущий файл дожидаемся
                     if _exc_box[0] is not None:
                         raise _exc_box[0]
                 except Exception as _cpu_err:
@@ -529,6 +621,7 @@ def transcribe(file_path: Path) -> Optional[str]:
         bar = _progress_bar(done, total)
         print(f"  {bar}  «{short}»")
         _transcribe_cache[cache_key] = text
+        _cache_put(cache_as or file_path, text)
         return text
 
     except Exception as e:
@@ -563,7 +656,12 @@ def _init_ffmpeg():
 def extract_audio(video_path: Path) -> Optional[Path]:
     if _FFMPEG_BIN is None:
         _init_ffmpeg()
-    tmp = Path(tempfile.mktemp(suffix=".wav"))
+    # mkstemp, а не mktemp: у mktemp между выдачей имени и созданием файла
+    # есть окно, в которое имя может занять кто-то другой.
+    _fd, _tmp_name = tempfile.mkstemp(suffix=".wav")
+    import os as _os_t
+    _os_t.close(_fd)
+    tmp = Path(_tmp_name)
     try:
         _cflags = 0x08000000 if __import__('sys').platform == 'win32' else 0  # CREATE_NO_WINDOW
         r = subprocess.run(
@@ -572,13 +670,17 @@ def extract_audio(video_path: Path) -> Optional[Path]:
             capture_output=True, timeout=120,
             creationflags=_cflags
         )
-        return tmp if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0 else None
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            return tmp
     except FileNotFoundError:
         print("  ! ffmpeg не найден. Установи: pip3 install imageio-ffmpeg")
-        return None
     except Exception as e:
         print(f"  ! ffmpeg: {e}")
-        return None
+    try:                       # не оставляем пустой .wav в TEMP
+        tmp.unlink()
+    except Exception:
+        pass
+    return None
 
 
 def media_placeholder(is_video: bool = False) -> str:
@@ -600,11 +702,14 @@ def media_label(file_path: Optional[Path], is_video: bool = False) -> str:
     if CFG.skip_transcribe:
         return media_placeholder(is_video)
     if is_video:
-        tmp = extract_audio(file_path)
-        text = transcribe(tmp) if tmp else None
-        if tmp and tmp.exists():
-            try: tmp.unlink()
-            except: pass
+        # Сначала кэш по самому видео — чтобы не гонять ffmpeg ради готового текста
+        text = transcribe(file_path, cache_as=file_path) if _cache_get(file_path) else None
+        if not text:
+            tmp = extract_audio(file_path)
+            text = transcribe(tmp, cache_as=file_path) if tmp else None
+            if tmp and tmp.exists():
+                try: tmp.unlink()
+                except: pass
     else:
         text = transcribe(file_path)
     return f"[{icon} {kind}: {text}]" if text else media_placeholder(is_video)
@@ -1010,6 +1115,25 @@ def _parse_tg_html_date(title: str) -> Optional[datetime]:
     return None
 
 
+def _tg_html_name(fn) -> str:
+    """Имя из <div class="from_name">. У пересланных внутри лежит ещё
+    <span class="date details"> с датой, у ботов — «via @bot»: get_text склеил
+    бы «Иван01.01.2020 12:00:00». Берём только собственный текст div."""
+    if fn is None:
+        return ""
+    name = "".join(fn.find_all(string=True, recursive=False)).strip()
+    return name or fn.get_text(" ", strip=True)
+
+
+def _tg_html_own_sender(body) -> str:
+    """Автор самого сообщения — только ПРЯМОЙ потомок body. Вглубь искать нельзя:
+    у «склеенного» сообщения (joined, без своей подписи) с пересылкой первым
+    находился from_name пересланного, и реплика уходила автору оригинала."""
+    if body is None:
+        return ""
+    return _tg_html_name(body.find("div", class_="from_name", recursive=False))
+
+
 def _parse_tg_html_message(div, folder: Path, id_map: dict) -> Optional[dict]:
     if "service" in (div.get("class") or []):
         return None
@@ -1025,8 +1149,7 @@ def _parse_tg_html_message(div, folder: Path, id_map: dict) -> Optional[dict]:
     date_div = body.find("div", class_="date")
     dt = _parse_tg_html_date(date_div.get("title", "")) if date_div else None
 
-    from_div = body.find("div", class_="from_name")
-    sender_raw = from_div.get_text(strip=True) if from_div else ""
+    sender_raw = _tg_html_own_sender(body)
 
     text_div = body.find("div", class_="text")
     text = ""
@@ -1070,8 +1193,7 @@ def _parse_tg_html_message(div, folder: Path, id_map: dict) -> Optional[dict]:
     fwd_div = body.find("div", class_="forwarded")
     fwd_from = ""
     if fwd_div:
-        fn = fwd_div.find("div", class_="from_name")
-        fwd_from = fn.get_text(strip=True) if fn else "неизвестно"
+        fwd_from = _tg_html_name(fwd_div.find("div", class_="from_name")) or "неизвестно"
         if not text:
             ft = fwd_div.find("div", class_="text")
             if ft:
@@ -1096,7 +1218,9 @@ def _parse_tg_html_message(div, folder: Path, id_map: dict) -> Optional[dict]:
                 rid = int(rm.group(1))
                 orig = id_map.get(rid)
                 if orig:
+                    # Как в TG JSON: имя цитируемого — через normalize_author
                     osender = orig.get("sender_raw", "")
+                    osender = normalize_author(osender) if osender else ""
                     otext = orig.get("text", "")[:75]
                 else:
                     osender, otext = "", "цитата не найдена"
@@ -1125,33 +1249,47 @@ def load_tg_html(folder: Path) -> Tuple[List[dict], str]:
     all_msgs: dict = {}
     contact = ""
     prev_sender = None
+    # Карта id → (автор, текст) для цитат — ОБЩАЯ на все файлы: ответ часто
+    # ссылается на сообщение из прошлого messagesN.html. Раньше она жила внутри
+    # одного файла, и такие цитаты выходили «цитата не найдена». Ответ всегда
+    # на более раннее сообщение, так что накопления по порядку файлов хватает.
+    id_map: dict = {}
+    map_prev = ""
 
     for html_file in files:
         raw  = html_file.read_bytes()
         html = raw.decode("utf-8", errors="replace")
         soup = BeautifulSoup(html, "html.parser")
 
-        id_map: dict = {}
         for div in soup.find_all("div", class_="message"):
+            if "service" in (div.get("class") or []):
+                continue
+            b = div.find("div", class_="body")
+            if not b:
+                continue
+            own = _tg_html_own_sender(b)
+            if own:
+                map_prev = own
             m = re.search(r"\d+", div.get("id", ""))
             if m:
-                bid = int(m.group())
-                b = div.find("div", class_="body")
-                if b:
-                    fn = b.find("div", class_="from_name")
-                    tt = b.find("div", class_="text")
-                    id_map[bid] = {
-                        "sender_raw": fn.get_text(strip=True) if fn else "",
-                        "text": tt.get_text(separator=" ", strip=True) if tt else "",
-                    }
+                tt = b.find("div", class_="text")
+                id_map[int(m.group())] = {
+                    "sender_raw": own or map_prev,   # у joined своей подписи нет
+                    "text": tt.get_text(separator=" ", strip=True) if tt else "",
+                }
 
         for div in soup.find_all("div", class_="message"):
+            # Автора запоминаем ДО разбора: сообщение без поддерживаемого
+            # содержимого (опрос, геометка) разбор отбросит, а следующие за ним
+            # «склеенные» реплики того же человека раньше уходили предыдущему.
+            if "service" not in (div.get("class") or []):
+                own = _tg_html_own_sender(div.find("div", class_="body"))
+                if own:
+                    prev_sender = normalize_author(own)
             p = _parse_tg_html_message(div, folder, id_map)
             if p:
                 if not p["sender"]:
                     p["sender"] = prev_sender or "неизвестно"
-                else:
-                    prev_sender = p["sender"]
                 if p["id"]:
                     all_msgs[p["id"]] = p
                 else:
@@ -1222,10 +1360,10 @@ def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
     Аудиофайлы ищет в папке audio/ рядом с JSON.
     """
     from datetime import timezone as _tz
-    json_files = sorted(
-        folder.glob("message_*.json"),
-        key=lambda p: int(re.search(r"\d+", p.stem).group() or 0)
-    )
+    def _num(p):   # message_1.json → 1; «message_old.json» без цифр раньше ронял разбор
+        m = re.search(r"\d+", p.stem)
+        return int(m.group()) if m else 0
+    json_files = sorted(folder.glob("message_*.json"), key=_num)
     if not json_files:
         return [], ""
 
@@ -1464,11 +1602,30 @@ def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
         if re.fullmatch(r'<(?:Media omitted|Без медиафайлов|Медиафайл отсутствует)>', text, re.IGNORECASE):
             text = "[Медиафайл — не включён в экспорт]"
 
-        # Call log entries — label them
-        if re.search(r'Аудиозвонок|Видеозвонок|Voice call|Video call', text, re.IGNORECASE):
-            answered = not re.search(r'Нет ответа|No answer|Missed', text, re.IGNORECASE)
-            kind = "Видеозвонок" if re.search(r'Видеозвонок|Video call', text, re.IGNORECASE) else "Аудиозвонок"
-            text = f"[📞 {kind}{'✓' if answered else ': нет ответа'}]"
+        # Call log entries — label them. Только если это ВСЯ строка — служебная
+        # запись звонка («Аудиозвонок, 5 мин», «Пропущенный видеозвонок»). Раньше
+        # хватало слова где угодно, и обычное «аудиозвонок не работает,
+        # перезвони» превращалось в метку звонка — текст терялся.
+        _call = re.match(r'^(Пропущенный\s+|Missed\s+)?(аудиозвонок|видеозвонок|voice call|video call)(.*)$',
+                         text, re.IGNORECASE | re.DOTALL)
+        if _call and re.fullmatch(
+                r'(?:[\s,.:·•\-–—\d]|(?:мин|сек|ч|min|sec|hr)\w*|нет ответа|no answer'
+                r'|нажмите[^\n]*|tap[^\n]*)*', _call.group(3), re.IGNORECASE):
+            answered = not (_call.group(1) or re.search(r'Нет ответа|No answer', text, re.IGNORECASE))
+            kind = "Видеозвонок" if re.search(r'видеозвонок|video call', _call.group(2), re.IGNORECASE) else "Аудиозвонок"
+            text = f"[📞 {kind}{' ✓' if answered else ': нет ответа'}]"
+
+        # Медиа не включено в экспорт: это вся строка («изображение отсутствует»),
+        # у документа перед ней имя файла («отчёт.pdf • 3 стр. документ
+        # отсутствует»). Раньше совпадение где угодно глотало обычный текст
+        # вроде «видео пропущено, пересниму».
+        _om = re.search(
+            r'(?:^|\s)(изображение|аудиофайл|видео|документ|стикер|gif|карточка контакта|'
+            r'image|audio|video|document|sticker|contact card)\s+'
+            r'(?:отсутствует|пропущен\w*|omitted)\s*$',
+            text, re.IGNORECASE)
+        _is_omitted = bool(_om) and (_om.start() == 0
+                                     or _om.group(1).lower() in ("документ", "document"))
 
         # Voice message (any *.opus — iOS: AUDIO-*.opus, Android: PTT-*.opus)
         vm = re.search(
@@ -1502,12 +1659,7 @@ def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
             am = re.search(r'<(?:прикреплено|attached):\s*(\S+)\s*>', text, re.IGNORECASE)
             text = f"[📎 {am.group(1)}]"
         # Omitted media — "without files" export (iOS: "отсутствует", EN: "omitted")
-        elif re.search(
-            r'(?:изображение|аудиофайл|видео|документ|стикер|gif|'
-            r'image|audio|video|document|sticker)\s+'
-            r'(?:отсутствует|пропущен\w*|omitted)',
-            text, re.IGNORECASE
-        ):
+        elif _is_omitted:
             if re.search(r'аудиофайл|audio', text, re.IGNORECASE):
                 text = "[🎤 Голосовое — файл не включён в экспорт]"
             elif re.search(r'видео|video', text, re.IGNORECASE):
@@ -1949,6 +2101,8 @@ def main():
         print("Проверь что в папке есть result.json или messages*.html")
         sys.exit(1)
 
+    _cache_open(raw_valid[0])
+
     if CFG.use_whisper:
         total = 0
         for f in raw_valid:
@@ -2021,6 +2175,7 @@ def main():
         safe = re.sub(r'[\\/*?:"<>|]', "", name.split()[0])
         out_path = output_dir / f"{safe}{ext}"
 
+    _cache_flush()
     result = format_output(all_messages, sources, contact or "неизвестно", CFG.output_format)
     out_path.write_text(result, encoding="utf-8")
     kb = out_path.stat().st_size // 1024
@@ -2104,6 +2259,7 @@ def process_folder(folder_path: str,
         if not folder.exists():
             if log_cb: log_cb(f"Ошибка: папка не найдена: {folder_path}")
             return None
+        _cache_open(folder if folder.is_dir() else folder.parent)
 
         raw_valid = [folder] if folder.is_dir() else []
 
@@ -2452,6 +2608,8 @@ def process_folder(folder_path: str,
         # отмена или ошибка посреди прохода с периодом оставляли его True, и
         # до перезапуска проги ни одно голосовое больше не расшифровывалось.
         CFG.skip_transcribe = False
+        _cache_flush()          # кэш расшифровок — и при отмене, и при ошибке
+        _release_whisper_memory()   # модель из памяти — тоже при любом выходе
         _sys.stdout = old_stdout
         _sys.stderr = old_stderr
 
@@ -2494,6 +2652,7 @@ def process_audio(source_path: str,
     CFG.whisper_model = model
     _voice_counter["done"] = 0
     _voice_counter["total"] = len(files)
+    _cache_open(out_dir)
 
     if log_cb: log_cb(f"Найдено аудио: {len(files)} файл(ов)")
     if log_cb: log_cb(f"  Модель: {model}")
@@ -2587,6 +2746,7 @@ def process_audio(source_path: str,
             log_cb(f"  [{_bar}] {i}/{len(files)} ({int(_pct*100)}%)" +
                    (f"  «{_preview}»" if _preview else ""))
 
+    _cache_flush()
     if not blocks:
         _release_whisper_memory()
         return None

@@ -34,8 +34,6 @@ from datetime import datetime
 from pathlib import Path
 
 import sys
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 # requests и прочее ставится в {app}\base_packages, а не в системный Python —
 # скрипт лежит в {app}\tools, путь добавляем сами (как merge_chat.py).
@@ -80,7 +78,8 @@ def vk(method: str, token: str, **params) -> dict:
             r = SESSION.get(f"{API}/{method}", params=params, timeout=30)
             data = r.json()
         except (requests.exceptions.Timeout,
-                requests.exceptions.ConnectionError) as e:
+                requests.exceptions.ConnectionError,
+                ValueError) as e:       # ValueError — ответ не JSON (502/HTML-заглушка)
             last_exc = e
             time.sleep(backoff)
             backoff *= 2
@@ -98,7 +97,9 @@ def vk(method: str, token: str, **params) -> dict:
 
 
 def fetch_all_conversations(token: str) -> list[dict]:
-    """Забирает все диалоги постранично."""
+    """Забирает все диалоги постранично. profiles/groups VK отдаёт одним списком
+    на страницу, а не внутри каждого диалога — раскладываем их по диалогам
+    (_names), иначе у --list все имена выходили пустыми."""
     conversations = []
     offset = 0
     while True:
@@ -106,6 +107,10 @@ def fetch_all_conversations(token: str) -> list[dict]:
         items = resp.get("items", [])
         if not items:
             break
+        names = {}
+        _collect_names(resp, names)
+        for it in items:
+            it["_names"] = names
         conversations.extend(items)
         if len(conversations) >= resp["count"]:
             break
@@ -125,8 +130,9 @@ def _collect_names(resp: dict, names: dict):
         names[str(-g["id"])] = g.get("name", f"club{g['id']}")
 
 
-def fetch_messages(peer_id: int, token: str) -> tuple[list[dict], dict]:
-    """Забирает историю диалога + карту id→имя (для атрибуции в групповых чатах)."""
+def fetch_messages(peer_id: int, token: str, progress=None) -> tuple[list[dict], dict]:
+    """Забирает историю диалога + карту id→имя (для атрибуции в групповых чатах).
+    progress(done, total) — после каждой страницы (GUI рисует по нему полоску)."""
     messages, names = [], {}
     offset = 0
     while True:
@@ -137,11 +143,21 @@ def fetch_messages(peer_id: int, token: str) -> tuple[list[dict], dict]:
         if not items:
             break
         messages.extend(items)
+        if progress:
+            progress(len(messages), resp.get("count", 0))
         if len(messages) >= resp["count"]:
             break
         offset += 200
         time.sleep(PAUSE)
-    return list(reversed(messages)), names
+    # Пока листали страницы, могли прийти новые сообщения: offset съезжает, и
+    # одно и то же сообщение попадает дважды. Дубли по id убираем здесь.
+    seen, uniq = set(), []
+    for m in reversed(messages):
+        if m.get("id") in seen:
+            continue
+        seen.add(m.get("id"))
+        uniq.append(m)
+    return uniq, names
 
 
 def save_dialog(peer_id: int, info: dict, messages: list[dict], names: dict) -> int:
@@ -167,21 +183,47 @@ def save_dialog(peer_id: int, info: dict, messages: list[dict], names: dict) -> 
     return len(new_msgs)
 
 
+def peer_info(peer_id: int, token: str, names: dict) -> dict:
+    """info для одного диалога (--peer, кнопка в GUI): имя человека/сообщества
+    из names, у беседы — её название (в names его нет, раньше выходило пусто)."""
+    name = names.get(str(peer_id), "")
+    if not name and peer_id >= 2_000_000_000:
+        try:
+            resp = vk("messages.getConversationsById", token, peer_ids=peer_id)
+            items = resp.get("items") or []
+            if items:
+                name = (items[0].get("chat_settings") or {}).get("title", "")
+        except Exception:
+            pass
+    return {"peer_id": peer_id, "name": name}
+
+
 def conv_info(conv: dict) -> dict:
     peer = conv["conversation"]["peer"]
     peer_id = peer["id"]
     last_msg = conv.get("last_message", {})
-    profiles = {p["id"]: p for p in conv.get("profiles", [])}
-    profile = profiles.get(peer_id, {})
+    if peer.get("type") == "chat":
+        # Беседа: имя — её название, в профилях его нет
+        name = (conv["conversation"].get("chat_settings") or {}).get("title", "")
+    else:
+        names = dict(conv.get("_names") or {})
+        _collect_names(conv, names)          # на случай, если профили пришли в самом диалоге
+        name = names.get(str(peer_id), "")   # люди — id, сообщества — -id (см. _collect_names)
     return {
         "peer_id": peer_id,
         "type": peer.get("type"),
-        "name": f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip(),
+        "name": name,
         "last_message_date": last_msg.get("date"),
     }
 
 
 def main():
+    # UTF-8 в консоль — только при запуске скриптом, не при импорте из GUI
+    # (там stdout может быть None). reconfigure, а не TextIOWrapper: второй
+    # объект над тем же буфером закрывает его при сборке мусора.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="Выгрузка истории ВК через API")
     ap.add_argument("--list", action="store_true",
                     help="показать все диалоги (peer_id + имя), ничего не качая — "
@@ -222,7 +264,7 @@ def main():
     if args.peer:
         print(f"[{datetime.now():%H:%M:%S}] Тяну диалог {args.peer}...")
         messages, names = fetch_messages(args.peer, token)
-        info = {"peer_id": args.peer, "name": names.get(str(args.peer), "")}
+        info = peer_info(args.peer, token, names)
         added = save_dialog(args.peer, info, messages, names)
         print(f"  {len(messages)} сообщений, {added} новых")
         print(f"Экспорт: {OUT_DIR}")

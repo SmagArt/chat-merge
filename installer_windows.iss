@@ -1,5 +1,5 @@
 ﻿#define AppName "Merge Chat"
-#define AppVersion "2.9.1"
+#define AppVersion "2.9.2"
 #define AppPublisher "Artem Smagin"
 #define AppURL "https://github.com/SmagArt/chat-merge"
 
@@ -52,6 +52,7 @@ Source: "python-installer\python-3.13.2-amd64.exe"; DestDir: "{tmp}"; Flags: ign
 
 Source: "merge_chat.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "merge_chat_gui.py"; DestDir: "{app}"; Flags: ignoreversion
+Source: "app_paths.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "merge_chat.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "merge_chat_1024.png"; DestDir: "{app}"; Flags: ignoreversion
 Source: "requirements.txt"; DestDir: "{app}"; Flags: ignoreversion
@@ -126,12 +127,124 @@ begin
     Result := '';
 end;
 
+// ── Бандленый Python ───────────────────────────────────────────────────────
+// Штатный установщик python.org ставит его per-user и регистрирует в
+// «Установленных приложениях» + HKCU\Software\Python\PythonCore\3.13. Удаление
+// папки {app} регистрацию не убирает: Python оставался в списке программ и в
+// реестре, указывая в пустоту. Сносим его штатно — но ТОЛЬКО если он наш:
+//   1) {app}\python\python.exe существует (TargetDir не был проигнорирован —
+//      иначе Python уже стоял у пользователя до нас);
+//   2) per-user регистрация 3.13 указывает внутрь {app}\python;
+//   3) ровно один ключ удаления «Python 3.13.2 (64-bit)» с QuietUninstallString.
+// Любое сомнение → не трогаем: снести пользователю его собственный Python
+// (на нём сидят другие его программы) хуже, чем оставить запись в реестре.
+function BundledPythonUninstallCmd(AppDir: String): String;
+var
+  Keys: TArrayOfString;
+  I, Found: Integer;
+  Key, Disp, Q, InstallPath: String;
+begin
+  Result := '';
+  if not FileExists(AddBackslash(AppDir) + 'python\python.exe') then Exit;
+  if not RegQueryStringValue(HKCU, 'Software\Python\PythonCore\3.13\InstallPath', '', InstallPath) then Exit;
+  if Pos(Lowercase(AddBackslash(AddBackslash(AppDir) + 'python')),
+         Lowercase(AddBackslash(InstallPath))) <> 1 then Exit;
+  Found := 0;
+  if RegGetSubkeyNames(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall', Keys) then
+    for I := 0 to GetArrayLength(Keys) - 1 do
+    begin
+      Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' + Keys[I];
+      if RegQueryStringValue(HKCU, Key, 'DisplayName', Disp) and
+         (CompareText(Trim(Disp), 'Python 3.13.2 (64-bit)') = 0) and
+         RegQueryStringValue(HKCU, Key, 'QuietUninstallString', Q) and (Trim(Q) <> '') then
+      begin
+        Found := Found + 1;
+        Result := Trim(Q);
+      end;
+    end;
+  if Found <> 1 then Result := '';
+end;
+
+// "C:\path\x.exe" /uninstall /quiet  →  Exe + Params
+procedure SplitCommand(Cmd: String; var Exe, Params: String);
+var
+  P: Integer;
+begin
+  Cmd := Trim(Cmd);
+  if (Length(Cmd) > 0) and (Cmd[1] = '"') then
+  begin
+    Delete(Cmd, 1, 1);
+    P := Pos('"', Cmd);
+    if P = 0 then begin Exe := Cmd; Params := ''; Exit; end;
+    Exe := Copy(Cmd, 1, P - 1);
+    Params := Trim(Copy(Cmd, P + 1, Length(Cmd)));
+  end else begin
+    P := Pos(' ', Cmd);
+    if P = 0 then begin Exe := Cmd; Params := ''; Exit; end;
+    Exe := Copy(Cmd, 1, P - 1);
+    Params := Trim(Copy(Cmd, P + 1, Length(Cmd)));
+  end;
+end;
+
+procedure UninstallBundledPython();
+var
+  Cmd, Exe, Params: String;
+  Code: Integer;
+begin
+  Cmd := BundledPythonUninstallCmd(ExpandConstant('{app}'));
+  if Cmd = '' then Exit;
+  SplitCommand(Cmd, Exe, Params);
+  if FileExists(Exe) then
+    Exec(Exe, Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
+// ── Установка из-под ЧУЖОЙ учётной записи администратора ─────────────────
+// Папка установки — в {localappdata} того, кто запустил повышенный установщик.
+// Если UAC спросил пароль другого администратора, программа встала бы в ЕГО
+// профиль, а у вошедшего пользователя не было бы ни ярлыка, ни доступа.
+// Сравниваем профиль исходного пользователя (ExecAsOriginalUser) с текущим.
+// Не удалось проверить — не мешаем (fail-open): ложный отказ хуже.
+function OriginalUserProfile(): String;
+var
+  Marker: String;
+  S: AnsiString;
+  Code: Integer;
+begin
+  Result := '';
+  Marker := ExpandConstant('{commonappdata}\MergeChat_setup_user.txt');
+  DeleteFile(Marker);
+  // "> file echo X" — не "echo X> file": профиль вида User2 дал бы "2>".
+  if ExecAsOriginalUser(ExpandConstant('{cmd}'), '/c > "' + Marker + '" echo %USERPROFILE%',
+                        '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    if LoadStringFromFile(Marker, S) then
+      Result := Trim(String(S));
+  DeleteFile(Marker);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Orig, Cur: String;
+begin
+  Result := '';
+  Orig := OriginalUserProfile();
+  Cur := GetEnv('USERPROFILE');
+  if (Orig <> '') and (Cur <> '') and (CompareText(Orig, Cur) <> 0) then
+    Result := 'Установщик получил права администратора от другой учётной записи.' + #13#10 +
+              'Merge Chat ставится в личную папку пользователя, поэтому встал бы в профиль' + #13#10 +
+              Cur + ',' + #13#10 + 'а не в ваш (' + Orig + ') — и у вас не запустился бы.' + #13#10#13#10 +
+              'Чтобы поставить Merge Chat себе, вашей учётной записи нужны права' + #13#10 +
+              'администратора — попросите администратора их выдать и запустите установку снова.';
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Py: String;
   Code: Integer;
 begin
   if CurUninstallStep <> usUninstall then Exit;
+  // До удаления файлов: штатный деинсталлятор Python сам вычистит {app}\python
+  // и свою регистрацию. Папку {app} после этого добьёт [UninstallDelete].
+  UninstallBundledPython();
   Py := GetRecordedPython();
   if Py = '' then Exit;
   if MsgBox('Удалить также пакеты, которые прошлые версии Merge Chat'#13#10 +
