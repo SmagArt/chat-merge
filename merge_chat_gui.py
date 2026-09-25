@@ -73,6 +73,21 @@ def _whisper_available() -> bool:
 
 _WHISPER_OK = _whisper_available()
 
+# Расширения аудио — одно место для GUI (выбор файла, drag&drop, автодетект).
+_AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".oga", ".opus",
+               ".aac", ".flac", ".webm", ".amr", ".mp4"}
+
+
+def _source_has_audio(path) -> bool:
+    """Есть ли в источнике хоть один аудио/видео-файл (до первого найденного)."""
+    try:
+        p = Path(path)
+        if p.is_file():
+            return p.suffix.lower() in _AUDIO_EXTS
+        return any(f.suffix.lower() in _AUDIO_EXTS and f.is_file() for f in p.rglob("*"))
+    except Exception:
+        return True     # не смогли проверить — пусть лучше спросит
+
 # Точные размеры .pt на CDN — ОДИН источник правды. Из них выводятся и
 # подпись на кнопке, и порог «докачано ли». Раньше это были три отдельных
 # списка руками, и подпись «75 МБ» расходилась с полоской, которая считала
@@ -264,6 +279,10 @@ def dl_fetch(item, cancel, on_bytes, on_log, conns=DL_CONNECTIONS,
 
     if not ranges:
         on_log(f"{item.label}: сервер без Range — качаю в один поток")
+        # Один кусок = весь файл. Раньше chunk оставался 8 МБ, и однопоточный
+        # режим писал только первые 8 МБ: колесо без SHA сохранялось полного
+        # размера, но с нулями в хвосте.
+        chunk = total
         n_chunks, conns = 1, 1
         done_idx = set()
 
@@ -318,25 +337,27 @@ def dl_fetch(item, cancel, on_bytes, on_log, conns=DL_CONNECTIONS,
                         rq.add_header("Range", f"bytes={start}-{end}")
                     r = urllib.request.urlopen(rq, timeout=30)
                     try:
-                        buf = bytearray()
-                        while len(buf) < want:
-                            if cancel.is_set():
-                                raise _Cancelled()
-                            b = r.read(min(DL_READ, want - len(buf)))
-                            if not b:
-                                break
-                            buf += b
-                            got += len(b)
-                            with lock:
-                                live[0] += len(b)
-                            _tick()
+                        # Пишем по ходу чтения, а не копим кусок в памяти: в
+                        # однопоточном режиме «кусок» — это весь torch (2.5 ГБ).
+                        # Готовым кусок считается только по индексу .idx, так что
+                        # оборванная запись просто перепишется на повторе.
+                        with open(part, "r+b") as f:
+                            f.seek(start)
+                            while got < want:
+                                if cancel.is_set():
+                                    raise _Cancelled()
+                                b = r.read(min(DL_READ, want - got))
+                                if not b:
+                                    break
+                                f.write(b)
+                                got += len(b)
+                                with lock:
+                                    live[0] += len(b)
+                                _tick()
                     finally:
                         r.close()
-                    if len(buf) != want:
-                        raise IOError(f"неполный кусок {len(buf)}/{want}")
-                    with open(part, "r+b") as f:
-                        f.seek(start)
-                        f.write(buf)
+                    if got != want:
+                        raise IOError(f"неполный кусок {got}/{want}")
                     with lock:
                         live[0] -= got          # переносим из «в пути» в «готово»
                         committed[0] += want
@@ -866,10 +887,7 @@ class App(_BaseApp):
         elif p.is_file():
             # Файл принимаем, режим определит _run по расширению
             self.folder_var.set(path)
-            icon = "🎙 " if p.suffix.lower() in {
-                ".mp3",".wav",".m4a",".ogg",".oga",".opus",
-                ".aac",".flac",".webm",".amr",".mp4"
-            } else ""
+            icon = "🎙 " if p.suffix.lower() in _AUDIO_EXTS else ""
             self.flbl.configure(text=f"{icon}{path}", text_color=T("TEXT"))
             self._add_recent(path)
             self._save_cfg()
@@ -1419,18 +1437,27 @@ class App(_BaseApp):
     # Заменяет ctk.CTkToplevel — иначе диалог появляется на случайной позиции
     # ОС, выглядит «отдельной программой». Оверлей всегда центрирован в окне.
     def _overlay(self, title: str, width: int = 520, height: int = 420,
-                 backdrop: bool = False):
+                 backdrop: bool = False, on_close=None, busy=None):
         """Возвращает (overlay_root, content_frame, close_fn).
         content_frame — куда класть содержимое диалога (pack/grid внутри).
         width/height — желаемый минимум; карточка тянется до 85% окна.
         backdrop=False (по умолчанию) — карточка кладётся поверх главного окна
         без затемнения: главный UI остаётся виден вокруг карточки. Раньше дефолт
         был True и закрашивал всё окно ровным SURFACE — маленькая карточка в
-        огромном тёмном поле выглядела как «сломанное пустое окно»."""
-        # Закрываем предыдущий оверлей если он есть (чтобы не накладывались)
-        prev = getattr(self, "_active_overlay", None)
-        if prev is not None:
-            try: prev.destroy()
+        огромном тёмном поле выглядела как «сломанное пустое окно».
+
+        on_close — что делают ✕ / Esc / клик мимо (по умолчанию — просто закрыть).
+        busy() → True, пока оверлей нельзя снести молча (идёт загрузка): новый
+        оверлей тогда ложится поверх, а этот остаётся под ним. Раньше любой
+        новый оверлей («Справка», «О программе») уничтожал панель загрузки, а
+        сама загрузка и pip продолжались невидимо."""
+        stack = self.__dict__.setdefault("_overlay_stack", [])
+        # Закрываем предыдущие оверлеи (чтобы не накладывались) — кроме занятых
+        for ent in list(stack):
+            if ent["busy"] is not None and ent["busy"]():
+                continue
+            stack.remove(ent)
+            try: ent["frame"].destroy()
             except Exception: pass
 
         # Карточка ровно того размера, что запросил вызывающий — не раздуваем
@@ -1453,7 +1480,8 @@ class App(_BaseApp):
             overlay = ctk.CTkFrame(self, fg_color="transparent",
                                    width=card_w + 10, height=card_h + 10)
             overlay.place(relx=0.5, rely=0.5, anchor="center")
-        self._active_overlay = overlay
+        ent = {"frame": overlay, "busy": busy, "close": None}
+        stack.append(ent)
 
         # Имитация тени
         shadow = ctk.CTkFrame(overlay, fg_color=T("BG"), corner_radius=16,
@@ -1467,11 +1495,21 @@ class App(_BaseApp):
         card.pack_propagate(False)
 
         def _close():
-            self._active_overlay = None
-            try: self.unbind("<Escape>")
-            except Exception: pass
+            if ent in stack:
+                stack.remove(ent)
             try: overlay.destroy()
             except Exception: pass
+            # Esc переходит к оверлею, который остался сверху (если есть)
+            try:
+                if stack:
+                    self.bind("<Escape>", lambda e, top=stack[-1]: top["close"]())
+                else:
+                    self.unbind("<Escape>")
+            except Exception:
+                pass
+
+        user_close = on_close or _close
+        ent["close"] = user_close
 
         head = ctk.CTkFrame(card, fg_color="transparent", height=42)
         head.pack(fill="x", padx=16, pady=(10, 0))
@@ -1481,7 +1519,7 @@ class App(_BaseApp):
         ctk.CTkButton(head, text="✕", width=30, height=28, font=self._f(14),
                       fg_color="transparent", hover_color=T("BORDER"),
                       text_color=T("SUB"), corner_radius=6,
-                      command=_close).pack(side="right")
+                      command=user_close).pack(side="right")
         ctk.CTkFrame(card, fg_color=T("BORDER"), height=1).pack(
             fill="x", padx=16, pady=(6, 0))
 
@@ -1489,9 +1527,9 @@ class App(_BaseApp):
         content.pack(fill="both", expand=True, padx=16, pady=12)
 
         # Esc → закрыть; клик вне карточки → закрыть
-        self.bind("<Escape>", lambda e: _close())
+        self.bind("<Escape>", lambda e: user_close())
         overlay.bind("<Button-1>",
-                     lambda e: _close() if e.widget is overlay else None)
+                     lambda e: user_close() if e.widget is overlay else None)
         return overlay, content, _close
 
     def _pick_date(self):
@@ -1940,13 +1978,18 @@ class App(_BaseApp):
         multi=True добавляет вторую полоску «Всего» — она нужна движку
         (24 колеса) и лишняя для одной модели.
         """
-        overlay, content, raw_close = self._overlay(title, width=580,
-                                                    height=470 if multi else 420)
         # Панель закрыли — виджетов больше нет, а поток загрузки про это не
         # знает и продолжает слать сюда прогресс. Без флага каждый такой вызов
         # это TclError «invalid command name» в консоль. Заодно закрытие панели
-        # означает отмену: качать в никуда смысла нет.
+        # означает отмену: качать в никуда смысла нет. Это касается ЛЮБОГО
+        # закрытия — ✕, Esc, «Отмена»/«Закрыть»; раньше ✕ и Esc закрывали
+        # панель мимо close(), и загрузка шла дальше невидимо.
         alive = [True]
+        running = [True]          # пока идёт — другие оверлеи панель не сносят
+
+        overlay, content, raw_close = self._overlay(
+            title, width=580, height=470 if multi else 420,
+            on_close=lambda: close(), busy=lambda: running[0] and alive[0])
 
         def close():
             alive[0] = False
@@ -2029,6 +2072,7 @@ class App(_BaseApp):
                     text=f"Всего: {_fmt_mb(gdone)} / {_fmt_mb(gtotal)} ({gp*100:.0f}%)")
 
         def finish(ok, msg):
+            running[0] = False
             _append(msg)
             if ok:
                 bar.set(1.0)
@@ -2071,6 +2115,10 @@ class App(_BaseApp):
         m = self.model_var.get() if hasattr(self, "model_var") else ""
         if m not in _WHISPER_URLS:
             return
+        # Вторая загрузка поверх идущей писала бы в тот же .part теми же
+        # потоками. Сюда можно попасть и из «Запустить», мимо серой кнопки.
+        if getattr(self, "_model_dl_active", False):
+            return
         url, sha, dest = _model_url_parts(m)
         cancel = threading.Event()
         ui, finish = self._dl_panel(
@@ -2082,8 +2130,11 @@ class App(_BaseApp):
         ui["append"](f"Файл: {dest}")
 
         def worker():
-            err = dl_fetch_all([DLItem(url, dest, sha=sha, label=f"{m}.pt")],
-                               cancel, ui)
+            try:
+                err = dl_fetch_all([DLItem(url, dest, sha=sha, label=f"{m}.pt")],
+                                   cancel, ui)
+            except Exception as e:          # иначе флаг «качается» залипнет навсегда
+                err = str(e)
             self._model_dl_active = False
             self.after(0, self._update_model_status)
             if err is None:
@@ -2274,11 +2325,19 @@ class App(_BaseApp):
                 env = os.environ.copy()
                 # Прямой доступ к VK мимо прокси (Karing и т.п.)
                 env["NO_PROXY"] = ".vk.com,.vk.ru,.userapi.com," + env.get("NO_PROXY", "")
+                # requests лежит в base_packages проги, а не в Python: дочерний
+                # процесс без этого пути падал на import requests на любой
+                # машине, где requests нет в системном Python.
+                env["PYTHONPATH"] = os.pathsep.join(
+                    [str(BASE_PKGS)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+                # Токен — через окружение, не аргументом: командную строку
+                # процесса видно в Диспетчере задач любому.
+                env["VK_TOKEN"] = token
                 ok = False
                 try:
                     self.after(0, _append, f"Тяну диалог {peer}…")
                     proc = subprocess.Popen(
-                        [sys.executable, str(vk_script), "--peer", str(peer), "--token", token],
+                        [sys.executable, str(vk_script), "--peer", str(peer)],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         text=True, encoding="utf-8", errors="replace",
                         cwd=str(vk_script.parent), env=env, **kw)
@@ -2387,7 +2446,26 @@ class App(_BaseApp):
             out.append((meta.get("name", "?"), meta.get("version", "?"), url))
         return out
 
+    def _engine_in_memory(self) -> bool:
+        """torch/whisper уже загружены в этот процесс (была расшифровка). Тогда
+        Windows держит их DLL открытыми: pip --upgrade и rmtree падают на
+        середине и оставляют torch наполовину удалённым."""
+        return "torch" in sys.modules or "whisper" in sys.modules
+
     def _show_install_dialog(self):
+        if getattr(self, "_engine_dl_active", False):
+            self._overlay_message(
+                "Установка Whisper",
+                "Установка уже идёт — её панель под этим окном.")
+            return
+        if self._engine_in_memory():
+            self._overlay_message(
+                "Обновление Whisper",
+                "Движок уже загружен в память — в этой сессии шла расшифровка.\n"
+                "Перезапустите программу и нажмите «Обновить» сразу после "
+                "запуска: иначе Windows не даст заменить файлы torch, и он "
+                "останется наполовину удалённым.")
+            return
         has_nv = _has_nvidia()
         cancel = threading.Event()
         ui, finish = self._dl_panel(
@@ -2399,6 +2477,16 @@ class App(_BaseApp):
         wheels_dir = LOCAL_PKGS / self.WHEELS_DIR_NAME
 
         def worker():
+            # Флаг «идёт установка» снимается при любом исходе, иначе после
+            # падения кнопка «Установить» больше не открылась бы до перезапуска.
+            try:
+                _work()
+            except Exception as e:
+                finish(False, f"Ошибка установки: {e}")
+            finally:
+                self._engine_dl_active = False
+
+        def _work():
             kw = {"creationflags": 0x08000000} if IS_WIN else {}
             log = ui["append"]
             log(f"Папка установки: {LOCAL_PKGS}")
@@ -2481,6 +2569,7 @@ class App(_BaseApp):
                    "pip вернул ошибку — смотрите лог. Скачанные колёса "
                    "сохранены, повтор не будет качать заново.")
 
+        self._engine_dl_active = True
         threading.Thread(target=worker, daemon=True).start()
 
     def _pip_install_fallback(self, has_nv, log, kw):
@@ -2513,6 +2602,13 @@ class App(_BaseApp):
         """Обновить состояние UI после установки — строго в main-thread."""
         if not ok:
             return
+        # Новые пакеты легли в каталог, который уже есть в sys.path: без сброса
+        # кэша импорта Python может «не увидеть» свежий whisper до перезапуска.
+        try:
+            import importlib
+            importlib.invalidate_caches()
+        except Exception:
+            pass
         self._whisper_installed = True
         try:
             self._whisper_banner.pack_forget()
@@ -2521,6 +2617,14 @@ class App(_BaseApp):
         self._update_model_status()
 
     def _show_whisper_uninstall_dialog(self):
+        if self._engine_in_memory():
+            self._overlay_message(
+                "Удаление Whisper",
+                "Движок загружен в память — в этой сессии шла расшифровка.\n"
+                "Перезапустите программу и удалите Whisper сразу после запуска: "
+                "сейчас Windows не даст стереть файлы torch, и удаление "
+                "оборвётся на середине.")
+            return
         overlay, content, close = self._overlay(
             "Удаление Whisper", width=560, height=440)
 
@@ -2905,8 +3009,11 @@ class App(_BaseApp):
             if IS_WIN:
                 if target_file is not None:
                     # /select, требует абсолютного пути с обратными слэшами
+                    # creationflags=0 явно: после первой расшифровки merge_chat
+                    # ставит CREATE_NO_WINDOW всем Popen по умолчанию.
                     subprocess.Popen(
-                        f'explorer /select,"{target_file}"', shell=False)
+                        f'explorer /select,"{target_file}"', shell=False,
+                        creationflags=0)
                 else:
                     os.startfile(str(target_dir))
             elif IS_MAC:
@@ -2939,22 +3046,34 @@ class App(_BaseApp):
         # Модель должна быть скачана ЗАРАНЕЕ нашим многопоточным загрузчиком.
         # Иначе whisper.load_model полезет качать сам: один поток, без докачки —
         # каждый перезапуск начинает с нуля. Это и есть «качает вечно».
-        if _WHISPER_OK and not self._model_downloaded(self.model_var.get()):
+        # Состояние Whisper — текущее (self._whisper_installed), а не снимок при
+        # старте: поставил движок в этой же сессии — проверка обязана сработать.
+        # Нет аудио в источнике — модель не понадобится, не спрашиваем.
+        m = self.model_var.get()
+        if (getattr(self, "_whisper_installed", False)
+                and not self._model_downloaded(m)
+                and _source_has_audio(folder)):
             from tkinter import messagebox
-            m = self.model_var.get()
             st = self._model_state(m)
             what = ("Модель «%s» скачана не полностью." % m if st == "partial"
                     else "Модель «%s» ещё не скачана." % m)
-            if messagebox.askyesno(
+            ans = messagebox.askyesnocancel(
                     "Merge Chat",
                     what + " (%s)\n\n"
                     "Скачать её сейчас в 8 потоков с докачкой?\n\n"
-                    "Если запустить обработку как есть — whisper будет тянуть "
-                    "модель сам, в один поток и без докачки: медленно, а при "
-                    "закрытии программы прогресс теряется целиком."
-                    % _MODEL_SIZE.get(m, "")):
+                    "Да — скачать (обработку запустите после).\n"
+                    "Нет — запустить как есть: whisper будет тянуть модель сам, "
+                    "в один поток и без докачки; при закрытии программы "
+                    "прогресс теряется целиком.\n"
+                    "Отмена — ничего не делать."
+                    % _MODEL_SIZE.get(m, ""))
+            if ans is None:
+                return
+            if ans:
                 self._download_selected_model()
-            return
+                return
+            # «Нет» — запуск как есть. Раньше return стоял на обоих ответах, и
+            # без скачанной модели нельзя было обработать даже чат без голосовых.
 
         self._save_cfg()
         self._add_recent(folder)
@@ -3028,21 +3147,18 @@ class App(_BaseApp):
 
                 # Автодетект режима: аудио-файл / папка с аудио / переписка
                 _src = Path(folder)
-                _audio_exts = getattr(_mc, "AUDIO_EXTS",
-                    {".mp3",".wav",".m4a",".ogg",".oga",".opus",
-                     ".aac",".flac",".webm",".amr",".mp4"})
+                _audio_exts = getattr(_mc, "AUDIO_EXTS", _AUDIO_EXTS)
                 _is_audio = False
                 if _src.is_file() and _src.suffix.lower() in _audio_exts:
                     _is_audio = True
                 elif _src.is_dir():
-                    _has_chat = any(
-                        list(_src.rglob(p))[:1]
-                        for p in ("result.json", "messages*.html", "_chat.txt", "*.txt", "*.json")
-                    )
-                    _has_audio = any(
-                        p for p in _src.rglob("*")
-                        if p.is_file() and p.suffix.lower() in _audio_exts
-                    )
+                    # Переписку узнаём тем же детектором, что и сама обработка.
+                    # Раньше признаком чата был ЛЮБОЙ *.txt/*.json — и после
+                    # первой расшифровки папки с аудио (она кладёт рядом
+                    # <папка>_audio.txt) «Запустить снова» считал её чатом и
+                    # выдавал пустой файл с «Готово».
+                    _has_chat = bool(_mc.find_all_chat_folders(_src))
+                    _has_audio = _source_has_audio(_src)
                     if _has_audio and not _has_chat:
                         _is_audio = True
 
@@ -3056,6 +3172,10 @@ class App(_BaseApp):
                         log_cb=log_cb,
                         progress_cb=lambda p: self.after(0, self.pbar.set, min(float(p), 1.0)),
                     )
+                    if out:
+                        # Путь — из возвращаемого значения: разбор строки лога
+                        # обрезал пути с « (» внутри («Чат (2)»).
+                        self.output_path = out
                     cancelled = _cancel_event.is_set()
                     self.after(0, self._done, bool(out), cancelled)
                     return
@@ -3082,6 +3202,8 @@ class App(_BaseApp):
                                   if getattr(self, "_adv_names_var", None) and self._adv_names_var.get()
                                   else ""),
                 )
+                if out:
+                    self.output_path = out
                 cancelled = _cancel_event.is_set()
                 self.after(0, self._done, bool(out), cancelled)
             except Exception as ex:

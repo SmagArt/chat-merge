@@ -118,6 +118,12 @@ begin
     Result := Trim(Result);
   end;
   if (Result <> '') and (not FileExists(Result)) then Result := '';
+  // Бандленый Python лежит внутри {app} и уходит вместе с папкой — спрашивать
+  // про «системный Python» тут бессмысленно. Раньше вопрос с путём
+  // {app}\python\python.exe всплывал при каждом обычном удалении.
+  if (Result <> '') and
+     (Pos(Lowercase(AddBackslash(ExpandConstant('{app}'))), Lowercase(Result)) = 1) then
+    Result := '';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

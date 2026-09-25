@@ -37,6 +37,12 @@ import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
+# requests и прочее ставится в {app}\base_packages, а не в системный Python —
+# скрипт лежит в {app}\tools, путь добавляем сами (как merge_chat.py).
+_base_pkgs = Path(__file__).resolve().parent.parent / "base_packages"
+if _base_pkgs.is_dir() and str(_base_pkgs) not in sys.path:
+    sys.path.insert(0, str(_base_pkgs))
+
 import requests
 
 try:

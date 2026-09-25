@@ -299,6 +299,33 @@ def _release_whisper_memory():
         pass
 
 
+def _hide_subprocess_windows():
+    """Whisper зовёт ffmpeg через subprocess — на Windows без CREATE_NO_WINDOW
+    каждое голосовое мигает консолью. Подменяем subprocess.Popen подклассом,
+    который ставит флаг по умолчанию (subprocess.run внутри зовёт тот же Popen).
+
+    Ставится ОДИН раз за процесс. Раньше обёртка навешивалась при каждом вызове
+    transcribe() поверх предыдущей: после ~1000 голосовых за сессию цепочка
+    упиралась в RecursionError, и все следующие ffmpeg падали — дальше везде
+    «нет расшифровки» до перезапуска. Подкласс, а не функция: иначе ломается
+    isinstance() и наследование от subprocess.Popen в чужом коде."""
+    if sys.platform != "win32":
+        return
+    if getattr(subprocess.Popen, "_mergechat_hidden", False):
+        return
+    _CNW = 0x08000000
+
+    class _HiddenPopen(subprocess.Popen):
+        _mergechat_hidden = True
+
+        def __init__(self, *a, **kw):
+            kw.setdefault("creationflags", _CNW)
+            super().__init__(*a, **kw)
+
+    subprocess.Popen = _HiddenPopen
+    _log_info("subprocess.Popen: CREATE_NO_WINDOW по умолчанию")
+
+
 def _progress_bar(done: int, total: int, w: int = 25) -> str:
     real_total = max(done, total) if total else done or 1
     pct  = done / real_total
@@ -420,24 +447,9 @@ def transcribe(file_path: Path) -> Optional[str]:
                 import whisper.audio as _wa
             if _FFMPEG_BIN and _wa:
                 _wa.FFMPEG_PATH = _FFMPEG_BIN  # type: ignore
-            # Patch whisper's subprocess calls to use CREATE_NO_WINDOW on Windows
-            # This prevents terminal flashes during every audio file transcription
-            import sys as _sys2
-            if _sys2.platform == "win32":
-                import subprocess as _subp
-                _orig_run = _subp.run
-                _orig_popen = _subp.Popen
-                _CNW = 0x08000000
-                def _run_hidden(*a, **kw):
-                    kw.setdefault("creationflags", _CNW)
-                    return _orig_run(*a, **kw)
-                def _popen_hidden(*a, **kw):
-                    kw.setdefault("creationflags", _CNW)
-                    return _orig_popen(*a, **kw)
-                _subp.run = _run_hidden
-                _subp.Popen = _popen_hidden
         except Exception:
             pass
+        _hide_subprocess_windows()
 
         _voice_counter["done"] += 1
         done, total = _voice_counter["done"], _voice_counter["total"]
@@ -569,6 +581,12 @@ def extract_audio(video_path: Path) -> Optional[Path]:
         return None
 
 
+def media_placeholder(is_video: bool = False) -> str:
+    """Метка «есть файл, но текста нет». Её же ищет второй проход расшифровки
+    (фильтр по датам) — поэтому строка задаётся в одном месте."""
+    return "[📹 Кружочек — нет расшифровки]" if is_video else "[🎤 Голосовое — нет расшифровки]"
+
+
 def media_label(file_path: Optional[Path], is_video: bool = False) -> str:
     icon = "📹" if is_video else "🎤"
     kind = "Кружочек" if is_video else "Голосовое"
@@ -577,6 +595,10 @@ def media_label(file_path: Optional[Path], is_video: bool = False) -> str:
     # Cancel check — stop immediately if user pressed Cancel
     if _cancel_event and _cancel_event.is_set():
         return f"[{icon} {kind} — отменено]"
+    # Первый проход с фильтром дат: не расшифровываем и не гоняем ffmpeg
+    # по кружочкам зря — нужные дорасшифрует второй проход.
+    if CFG.skip_transcribe:
+        return media_placeholder(is_video)
     if is_video:
         tmp = extract_audio(file_path)
         text = transcribe(tmp) if tmp else None
@@ -585,17 +607,21 @@ def media_label(file_path: Optional[Path], is_video: bool = False) -> str:
             except: pass
     else:
         text = transcribe(file_path)
-    return f"[{icon} {kind}: {text}]" if text else f"[{icon} {kind} — нет расшифровки]"
+    return f"[{icon} {kind}: {text}]" if text else media_placeholder(is_video)
 
 
 def find_file(base: Path, href: str) -> Optional[Path]:
-    if not href:
+    # «(File not included…)» — Telegram так пишет невыгруженные файлы. Искать
+    # его по всему экспорту бессмысленно, а rglob на каждое такое голосовое
+    # на больших экспортах занимал минуты.
+    if not href or href.startswith("(File not included"):
         return None
     c = base / href
     if c.exists():
         return c
+    import glob as _glob
     name = Path(href).name
-    matches = list(base.glob(f"**/{name}"))
+    matches = list(base.glob(f"**/{_glob.escape(name)}"))
     return matches[0] if matches else None
 
 
@@ -772,14 +798,18 @@ def load_tg_json(json_path: Path, folder: Path) -> Tuple[List[dict], str]:
 
             attachment = ""
             _msg_voice_path = None
+            _msg_voice_kind = None
+            _not_included = "(File not included" in str(ffile)
             if mtype == "voice_message":
                 vpath = find_file(folder, str(ffile)) if ffile else None
                 attachment = media_label(vpath, is_video=False)
-                if vpath and vpath.exists(): _msg_voice_path = str(vpath)
+                if vpath and vpath.exists():
+                    _msg_voice_path, _msg_voice_kind = str(vpath), "voice"
             elif mtype == "video_message":
                 vpath = find_file(folder, str(ffile)) if ffile else None
                 attachment = media_label(vpath, is_video=True)
-                if vpath and vpath.exists(): _msg_voice_path = str(vpath)
+                if vpath and vpath.exists():
+                    _msg_voice_path, _msg_voice_kind = str(vpath), "video"
             elif mtype == "sticker":
                 attachment = f"[Стикер {semoji}]".strip()
             elif photo:
@@ -787,12 +817,18 @@ def load_tg_json(json_path: Path, folder: Path) -> Tuple[List[dict], str]:
                 attachment = f"[📷 Фото: {Path(str(photo)).name}]" if ppath else "[📷 Фото]"
             elif mtype in ("photo", "image"):
                 attachment = "[📷 Фото]"
-            elif mtype == "video":
+            elif mtype in ("video", "video_file"):
                 attachment = "[🎬 Видео]"
+            elif mtype == "animation":
+                attachment = "[GIF]"
             elif mtype in ("audio_file", "audio"):
                 attachment = "[🎵 Аудио]"
-            elif ffile and "(File not included" not in str(ffile):
-                attachment = f"[📄 Файл: {fname}]"
+            elif ffile:
+                # Невыгруженный файл — тоже сообщение: раньше оно выпадало из
+                # вывода целиком, и в переписке пропадала реплика.
+                _nm = "" if str(fname).startswith("(File not included") else fname
+                attachment = (f"[📄 Файл{': ' + _nm if _nm else ''} — не выгружен]"
+                              if _not_included else f"[📄 Файл: {fname}]")
 
             if not text and not attachment:
                 continue
@@ -829,6 +865,7 @@ def load_tg_json(json_path: Path, folder: Path) -> Tuple[List[dict], str]:
                 "text":        full_text,
                 "source":      "tg_json",
                 "_voice_path": _msg_voice_path,
+                "_voice_kind": _msg_voice_kind,
             })
 
     # Count actual voice files on disk (deduplicated)
@@ -1000,6 +1037,7 @@ def _parse_tg_html_message(div, folder: Path, id_map: dict) -> Optional[dict]:
 
     # Медиа
     attachment = ""
+    voice_path = voice_kind = None
     mw = body.find("div", class_="media_wrap")
     if mw:
         a = mw.find("a", class_="media")
@@ -1014,9 +1052,13 @@ def _parse_tg_html_message(div, folder: Path, id_map: dict) -> Optional[dict]:
             elif "voice_message" in classes or "voice_messages" in href:
                 vpath = find_file(folder, href)
                 attachment = media_label(vpath, is_video=False)
+                if vpath and vpath.exists():
+                    voice_path, voice_kind = str(vpath), "voice"
             elif "round_video" in href or (title_t == "Video message"):
                 vpath = find_file(folder, href)
                 attachment = media_label(vpath, is_video=True)
+                if vpath and vpath.exists():
+                    voice_path, voice_kind = str(vpath), "video"
             elif "media_photo" in classes:
                 attachment = "[📷 Фото]"
             elif "media_video" in classes:
@@ -1067,6 +1109,8 @@ def _parse_tg_html_message(div, folder: Path, id_map: dict) -> Optional[dict]:
         "sender":     normalize_author(sender_raw) if sender_raw else None,
         "text":       full_text,
         "source":     "tg_html",
+        "_voice_path": voice_path,
+        "_voice_kind": voice_kind,
     }
 
 
@@ -1133,7 +1177,11 @@ def find_all_chat_folders(root: Path) -> List[Path]:
     for p in root.rglob("*.json"):
         try:
             head = p.read_bytes()[:300].decode("utf-8", errors="replace")
-            if '"messages"' in head or '"chats"' in head or '"participants"' in head:
+            # "peer_id" — первый ключ выгрузки vk_fetch_history.py. "messages"
+            # у неё идёт после names{}, и в беседе уезжает дальше 300 байт —
+            # без этой проверки vk_export внутри общей папки не находился.
+            if ('"messages"' in head or '"chats"' in head or '"participants"' in head
+                    or '"peer_id"' in head):
                 found.add(p.parent)
         except:
             pass
@@ -1142,8 +1190,9 @@ def find_all_chat_folders(root: Path) -> List[Path]:
         if re.match(r"messages\d*\.html", p.name, re.I):
             found.add(p.parent)
 
-    for p in root.rglob("_chat.txt"):
-        found.add(p.parent)
+    for d in {p.parent for p in root.rglob("*.txt")}:
+        if _find_wa_chat_file(d):
+            found.add(d)
 
     def _folder_sort_key(p):
         n = p.name
@@ -1196,14 +1245,25 @@ def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
             if _nm and _nm not in _all_parts:
                 _all_parts.append(_nm)
 
+        _matched_self = None
+        for _nm in _all_parts:
+            if unicodedata.normalize("NFC", _nm).lower() in CFG.my_names_lower:
+                _matched_self = _nm
+                break
+        # Группа (3+ участников): кто из них «я», по экспорту не понять —
+        # только по алиасам из поля «Твоё имя». Раньше всех, кроме первого,
+        # записывали в «я», и реплики чужих людей подписывались твоим именем.
+        _is_group = len(_all_parts) > 2
+
         # Имя контакта — тот, кто НЕ совпадает с алиасами «я»
         if not contact:
-            _matched_self = None
-            for _nm in _all_parts:
-                if unicodedata.normalize("NFC", _nm).lower() in CFG.my_names_lower:
-                    _matched_self = _nm
-                    break
-            if _matched_self:
+            if _is_group:
+                contact = _fix_instagram_encoding(data.get("title", "")) or "Группа"
+                if not _matched_self:
+                    print(f"  [!] Instagram (группа): ни один участник не совпал с "
+                          f"'{CFG.my_name}'. Участники: {_all_parts}. Добавь своё имя "
+                          f"в поле 'Твоё имя' через запятую.")
+            elif _matched_self:
                 # Алиас матчнулся — контакт это «другой» участник
                 for _nm in _all_parts:
                     if _nm != _matched_self:
@@ -1215,13 +1275,15 @@ def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
                 # Берём первого как peer-контакт.
                 contact = _all_parts[0]
 
-        # КРИТИЧНО: регистрируем всех НЕ-контактных участников как алиасы «себя».
-        # Иначе peer_display rename переименует свои сообщения в имя собеседника.
-        for _nm in _all_parts:
-            if _nm and _nm != contact:
-                _norm_n = unicodedata.normalize("NFC", _nm).lower()
-                if _norm_n not in CFG.my_names_lower:
-                    CFG.my_names_lower.append(_norm_n)
+        # КРИТИЧНО (только личка): второй участник лички — это «я», регистрируем
+        # его алиасом. Иначе peer_display rename переименует свои сообщения в имя
+        # собеседника. В группе так нельзя — там «не контакт» это все остальные.
+        if not _is_group:
+            for _nm in _all_parts:
+                if _nm and _nm != contact:
+                    _norm_n = unicodedata.normalize("NFC", _nm).lower()
+                    if _norm_n not in CFG.my_names_lower:
+                        CFG.my_names_lower.append(_norm_n)
 
         for m in data.get("messages", []):
             try:
@@ -1243,7 +1305,10 @@ def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
                 fname = Path(uri).name
                 candidate = folder / "audio" / fname
                 if candidate.exists():
-                    content = "[🎤 Голосовое — нет расшифровки]"
+                    # Расшифровка сразу, как у TG/WA. Раньше тут ставилась
+                    # заглушка, а дорасшифровка шла только при фильтре по
+                    # датам — без периода голосовые IG не расшифровывались вовсе.
+                    content = media_label(candidate, is_video=False)
                     voice_path = str(candidate)
                 else:
                     content = "[🎤 Голосовое — файл не найден]"
@@ -1269,6 +1334,7 @@ def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
             }
             if voice_path:
                 msg["_voice_path"] = voice_path
+                msg["_voice_kind"] = "voice"
             all_msgs.append(msg)
 
     all_msgs.sort(key=lambda x: x["dt"])
@@ -1280,31 +1346,59 @@ def load_instagram_json(folder: Path) -> Tuple[List[dict], str]:
 #  Парсинг WhatsApp TXT
 # ──────────────────────────────────────────────
 
+# WhatsApp: iOS пишет «[25.09.2026, 22:42:10] Имя: текст», Android —
+# «25.09.2026, 22:42 - Имя: текст», БЕЗ секунд. Раньше секунды были
+# обязательны, и Android-экспорт давал 0 сообщений. Год бывает двузначным.
+_WA_MARKS = "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+_WA_DT = r'(\d{1,2})\.(\d{1,2})\.(\d{2,4}),\s+(\d{1,2}):(\d{2})(?::(\d{2}))?'
+_WA_PAT_IOS = re.compile(r'^\[' + _WA_DT + r'\]\s+(.+?): (.*)$')
+_WA_PAT_ANDROID = re.compile(r'^' + _WA_DT + r'\s+-\s+(.+?): (.*)$')
+_WA_PAT_HDR_IOS = re.compile(r'^\[' + _WA_DT + r'\]')
+_WA_PAT_HDR_AND = re.compile(r'^' + _WA_DT + r'\s+-\s')
+
+
+def _wa_strip(s: str) -> str:
+    for c in _WA_MARKS:
+        s = s.replace(c, "")
+    return s
+
+
+def _find_wa_chat_file(folder: Path) -> Optional[Path]:
+    """Файл переписки WhatsApp в папке. iOS кладёт `_chat.txt`, Android —
+    «WhatsApp Chat with ….txt» / «Чат WhatsApp с ….txt», поэтому по имени
+    не ищем: берём .txt, в первых строках которого есть заголовок WA."""
+    chat = folder / "_chat.txt"
+    if chat.exists():
+        return chat
+    try:
+        cands = sorted(folder.glob("*.txt"))
+    except Exception:
+        return None
+    for p in cands:
+        try:
+            head = p.read_bytes()[:4096].decode("utf-8", errors="replace").lstrip("\ufeff")
+        except Exception:
+            continue
+        for line in head.splitlines()[:15]:
+            clean = _wa_strip(line.strip())
+            if _WA_PAT_IOS.match(clean) or _WA_PAT_ANDROID.match(clean):
+                return p
+    return None
+
+
 def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
     """
-    Загружает экспорт WhatsApp (_chat.txt).
-    Форматы: iOS [DD.MM.YYYY, HH:MM:SS] и Android DD.MM.YYYY, HH:MM:SS -
-    Голосовые: PTT-*.opus рядом с _chat.txt.
+    Загружает экспорт WhatsApp (_chat.txt на iOS, «WhatsApp Chat with ….txt» на Android).
+    Форматы: iOS [DD.MM.YYYY, HH:MM:SS] и Android DD.MM.YYYY, HH:MM -
+    Голосовые: *.opus рядом с файлом переписки.
     """
-    chat_file = folder / "_chat.txt"
-    if not chat_file.exists():
+    chat_file = _find_wa_chat_file(folder)
+    if not chat_file:
         return [], ""
 
-    _MARKS = "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
-
-    _PAT_IOS = re.compile(
-        r'^\[(\d{2})\.(\d{2})\.(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\]\s+(.+?): (.*)$'
-    )
-    _PAT_ANDROID = re.compile(
-        r'^(\d{2})\.(\d{2})\.(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\s+-\s+(.+?): (.*)$'
-    )
-    _PAT_HDR_IOS = re.compile(r'^\[(\d{2})\.(\d{2})\.(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\]')
-    _PAT_HDR_AND = re.compile(r'^(\d{2})\.(\d{2})\.(\d{4}),\s+(\d{2}):(\d{2}):(\d{2})\s+-')
-
-    def _strip(s):
-        for c in _MARKS:
-            s = s.replace(c, "")
-        return s
+    _PAT_IOS, _PAT_ANDROID = _WA_PAT_IOS, _WA_PAT_ANDROID
+    _PAT_HDR_IOS, _PAT_HDR_AND = _WA_PAT_HDR_IOS, _WA_PAT_HDR_AND
+    _strip = _wa_strip
 
     try:
         raw = chat_file.read_bytes()
@@ -1328,7 +1422,8 @@ def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
                 chunks.append((cur_dt, cur_sender, "\n".join(cur_lines)))
             d, mo, y, h, mi, sec, sender_raw, text = m.groups()
             try:
-                cur_dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec))
+                yy = int(y) + (2000 if len(y) == 2 else 0)
+                cur_dt = datetime(yy, int(mo), int(d), int(h), int(mi), int(sec or 0))
             except Exception:
                 cur_dt = None
             cur_sender = sender_raw.strip()
@@ -1360,6 +1455,15 @@ def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
         text = re.sub(r'\s*‎?<Сообщение изменено>$', '', text).strip()
         text = re.sub(r'\s*<Message edited>$', '', text, flags=re.IGNORECASE).strip()
 
+        # Android пишет вложения иначе, чем iOS: «PTT-….opus (файл добавлен)»
+        # вместо «<прикреплено: PTT-….opus>». Приводим к iOS-форме — дальше
+        # общая логика; а «<Без медиафайлов>» — экспорт без медиа.
+        text = re.sub(
+            r'(\S+\.\w{2,5})\s+\((?:file attached|файл добавлен|файл прикреплён|файл прикреплен)\)',
+            r'<attached: \1>', text, flags=re.IGNORECASE)
+        if re.fullmatch(r'<(?:Media omitted|Без медиафайлов|Медиафайл отсутствует)>', text, re.IGNORECASE):
+            text = "[Медиафайл — не включён в экспорт]"
+
         # Call log entries — label them
         if re.search(r'Аудиозвонок|Видеозвонок|Voice call|Video call', text, re.IGNORECASE):
             answered = not re.search(r'Нет ответа|No answer|Missed', text, re.IGNORECASE)
@@ -1375,8 +1479,7 @@ def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
             opus_path = folder / vm.group(1)
             if opus_path.exists():
                 voice_path = str(opus_path)
-                t = transcribe(opus_path)
-                text = f"[🎤 Голосовое: {t}]" if t else "[🎤 Голосовое — нет расшифровки]"
+                text = media_label(opus_path, is_video=False)
             else:
                 text = "[🎤 Голосовое — файл не найден]"
         # Photo
@@ -1424,6 +1527,7 @@ def load_whatsapp_txt(folder: Path) -> Tuple[List[dict], str]:
         }
         if voice_path:
             msg["_voice_path"] = voice_path
+            msg["_voice_kind"] = "voice"
         messages.append(msg)
 
     # WA-DM: ровно 2 уникальных отправителя. Если один из них матчит мои алиасы —
@@ -1546,7 +1650,7 @@ def load_chat_folder(folder: Path) -> Tuple[List[dict], str, str]:
             srcs.append("VK")
 
     # ── WhatsApp TXT ──────────────────────────────────────────────────
-    if (folder / "_chat.txt").exists():
+    if _find_wa_chat_file(folder):
         msgs, c = load_whatsapp_txt(folder)
         all_msgs.extend(msgs)
         if not contact and c:
@@ -1599,6 +1703,21 @@ SOURCE_FULL = {
     "ig":      "Instagram",
     "wa":      "WhatsApp",
 }
+
+
+_SOURCE_FAMILY = {"tg_json": "tg", "tg_html": "tg"}
+
+
+def _dedup_key(msg: dict):
+    """Ключ дубля — (мессенджер, id). Голый id сравнивать нельзя: у TG и VK это
+    независимые счётчики аккаунта, номера пересекаются, и сообщение другого
+    мессенджера с тем же номером молча выкидывалось как «дубль». TG JSON и
+    TG HTML — один мессенджер с одними id, их повторы по-прежнему ловим."""
+    mid = msg.get("id")
+    if not mid:
+        return None
+    src = msg.get("source") or ""
+    return (_SOURCE_FAMILY.get(src, src), mid)
 
 
 def _src_tag(msg: dict) -> str:
@@ -1863,7 +1982,7 @@ def main():
 
         new, dup = 0, 0
         for msg in msgs:
-            mid = msg.get("id")
+            mid = _dedup_key(msg)
             if mid and mid in seen_ids:
                 dup += 1
             else:
@@ -1965,12 +2084,15 @@ def process_folder(folder_path: str,
             _al = _ud.normalize("NFC", _a).lower()
             _lows.append(_al)
             if _al not in ("вы", "я", "me", "i"):
-                _lows.append(_a.lower().replace("ём", "ем"))
+                # ё/е в обе стороны: ввёл «Артем», а в экспорте «Артём» — и наоборот
+                _lows.append(_al.replace("ё", "е"))
+                _lows.append(_al.replace("ем", "ём"))
                 _lows.append(_ud.normalize("NFD", _a).lower())
         # Стандартные «вы»/«я»/«me» всегда считаем собой
         _lows += ["вы", "я", "me", "i"]
         CFG.my_names_lower = list(dict.fromkeys(_lows))  # уникальные с сохранением порядка
         CFG.peer_name = peer_display.strip()
+        CFG.skip_transcribe = False
         CFG.use_whisper    = True
         CFG.whisper_model  = model
         CFG.do_merge       = do_merge
@@ -2094,7 +2216,7 @@ def process_folder(folder_path: str,
             if src: sources.extend(src if isinstance(src, list) else [src])
             new_cnt, dup_cnt = 0, 0
             for msg in msgs:
-                mid = msg.get("id")
+                mid = _dedup_key(msg)
                 if mid and mid in seen_ids:
                     dup_cnt += 1
                 else:
@@ -2139,7 +2261,12 @@ def process_folder(folder_path: str,
 
             # Второй проход: расшифровываем только голосовые в отфильтрованных сообщениях
             if CFG.use_whisper:
-                voice_msgs = [m for m in all_messages if m.get("_voice_path")]
+                # Только те, где в тексте ещё стоит заглушка первого прохода.
+                voice_msgs = [
+                    m for m in all_messages
+                    if m.get("_voice_path")
+                    and media_placeholder(m.get("_voice_kind") == "video") in (m.get("text") or "")
+                ]
                 if voice_msgs:
                     _speed2={"tiny":0.3,"base":0.5,"small":1,"medium":2,"large":4}
                     _k2=_speed2.get(model,1)
@@ -2166,12 +2293,15 @@ def process_folder(folder_path: str,
                             break
                         vpath = m.get("_voice_path")
                         if vpath:
-                            text = transcribe(Path(vpath))
-                            if text:
-                                m["text"] = m.get("text", "").replace(
-                                    "[🎤 Голосовое — нет расшифровки]", f"[🎤 {text}]"
-                                ).replace("[🎤 Голосовое — файл не найден]", f"[🎤 {text}]"
-                                ).replace("[🎤 Голосовое]", f"[🎤 {text}]")
+                            # Та же media_label, что и в первом проходе: кружочки
+                            # идут через ffmpeg, формат метки один — «[🎤 Голосовое:
+                            # …]». Раньше подставлялись только 🎤-заглушки, и
+                            # расшифрованный кружочек оставался «нет расшифровки».
+                            _is_video = m.get("_voice_kind") == "video"
+                            label = media_label(Path(vpath), is_video=_is_video)
+                            ph = media_placeholder(_is_video)
+                            if label != ph:
+                                m["text"] = m.get("text", "").replace(ph, label, 1)
                         if progress_cb: progress_cb(0.5 + 0.3 * (j + 1) / _vn)
                 else:
                     if _pre_total > 0:
@@ -2198,14 +2328,11 @@ def process_folder(folder_path: str,
         # Проверяем: нашли ли хоть одно сообщение с именем автора
         # Если нет — пробуем найти реальное имя и подсказать
         if author and all_messages:
-            import unicodedata as _ud2
-            _my_low = [_ud2.normalize("NFC", author).lower(),
-                       author.lower().replace("ём","ем"),
-                       author.lower().replace("ем","ём")]
-            _found_me = any(
-                _ud2.normalize("NFC", (m.get("sender") or "")).lower() in _my_low
-                for m in all_messages
-            )
+            # Свои сообщения парсеры уже подписали CFG.my_name (normalize_author
+            # по всем алиасам). Раньше тут сравнивали с сырой строкой поля —
+            # «Артём, Tema» целиком — и при нескольких алиасах или заданном
+            # «Я →» предупреждение вылезало всегда, даже когда всё нашлось.
+            _found_me = any((m.get("sender") or "") == CFG.my_name for m in all_messages)
             if not _found_me:
                 # Собираем всех отправителей и их частоту
                 from collections import Counter as _Ctr
@@ -2295,6 +2422,8 @@ def process_folder(folder_path: str,
                 result = format_output(without_dt, sources, contact, output_format, show_timestamps, show_source)
                 nd_path.write_text(result, encoding="utf-8")
                 files_written += 1
+                if out_path is None:      # все без дат — иначе вернули бы "None"
+                    out_path = nd_path
             if progress_cb: progress_cb(1.0)
             if log_cb: log_cb(f"\n✓ Готово → {output_dir} ({files_written} файлов)")
         else:
@@ -2319,6 +2448,10 @@ def process_folder(folder_path: str,
         if log_cb: log_cb(_tb.format_exc())
         return None
     finally:
+        # Флаг первого прохода обязан сброситься при ЛЮБОМ выходе: раньше
+        # отмена или ошибка посреди прохода с периодом оставляли его True, и
+        # до перезапуска проги ни одно голосовое больше не расшифровывалось.
+        CFG.skip_transcribe = False
         _sys.stdout = old_stdout
         _sys.stderr = old_stderr
 
@@ -2357,6 +2490,7 @@ def process_audio(source_path: str,
         return None
 
     CFG.use_whisper = True
+    CFG.skip_transcribe = False
     CFG.whisper_model = model
     _voice_counter["done"] = 0
     _voice_counter["total"] = len(files)
