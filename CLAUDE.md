@@ -137,7 +137,7 @@ medium на GPU (TTS-голосовые + кружочек).
   `PrepareToInstall` отказывает, если UAC дал права ДРУГОЙ учётки (прога встала бы в её профиль).
 - **Сборка macOS:** версия из `VERSION`, в бандл — `bs4`/`requests`/`certifi`/`tools/`,
   frozen-режим без pip-кнопок; `.gitattributes` держит `*.command` в LF (папка едет на Mac через
-  Google Drive, bash с CRLF падает). Сама сборка на Mac после этого не проверялась.
+  Google Drive, bash с CRLF падает). Собрана на Mac 03.10.2026 (v2.9.3, GitHub Release вместе с .exe).
 - Мелочи: drag&drop нескольких файлов, `mkstemp` вместо `mktemp`, `find_file` с `glob.escape`,
   лаунчер проверяет Program Files, скорость в МБ/с, NVIDIA-детект в фоне, гонка счётчиков
   загрузчика, `message_*.json` без цифр.
@@ -334,8 +334,7 @@ _subp.run = _run_hidden
 
 ## Pending
 
-- [ ] Mac DMG v2.9.2 собрать на Mac Mini M4 (`bash build_mac.command`) и прогнать: старт, Whisper встроен, выгрузка ВК, конфиг/модели в Application Support
-- [ ] GitHub Release v2.9.2 (Windows .exe + Mac .dmg + source)
+- [ ] Mac DMG v2.9.3 вживую через окно: расшифровка голосового, выгрузка ВК, скачивание модели. Собран и выложен 03.10.2026 (Mac Mini M4, только arm64, 557 МБ); проверено: окно стартует, лог в Application Support, внутри whisper/assets, torch, bs4, ffmpeg arm64
 - [ ] Удаление бандленого Python деинсталлятором проверить на чистой машине (на машинах Артёма стоит свой Python 3.13.12 — бандл там не ставится)
 - [ ] (backlog v3.0) Миграция UI на PySide6 — см. `memory/project_chat_merge_qt_migration.md`. PyInstaller заодно решит «pythonw.exe в Диспетчере задач».
 
