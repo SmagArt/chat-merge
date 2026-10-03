@@ -334,6 +334,7 @@ _subp.run = _run_hidden
 
 ## Pending
 
+- [ ] Mac DMG собирать на Python с python.org (universal2, `/Library/Frameworks/Python.framework/Versions/3.13`), а не Homebrew: Homebrew-Python собран под текущую macOS, и DMG v2.9.3 (собран на Homebrew 3.13.12, macOS 26) не запустится ниже macOS 26 — `vtool -show-build` на `.so` в бандле даёт minos 26.0. `build_mac.command` python.org ищет первым — достаточно его поставить (+ pip-пакеты в него) и пересобрать
 - [ ] Mac DMG v2.9.3 вживую через окно: расшифровка голосового, выгрузка ВК, скачивание модели. Собран и выложен 03.10.2026 (Mac Mini M4, только arm64, 557 МБ); проверено: окно стартует, лог в Application Support, внутри whisper/assets, torch, bs4, ffmpeg arm64
 - [ ] Удаление бандленого Python деинсталлятором проверить на чистой машине (на машинах Артёма стоит свой Python 3.13.12 — бандл там не ставится)
 - [ ] (backlog v3.0) Миграция UI на PySide6 — см. `memory/project_chat_merge_qt_migration.md`. PyInstaller заодно решит «pythonw.exe в Диспетчере задач».
